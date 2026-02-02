@@ -449,7 +449,7 @@ class KernelBuilder:
                     (op2, v_val[c[3]], v_tmp1[p[3]], v_tmp2[p[3]]),
                 ]})
 
-            # Index computation
+            # Index computation: new_idx = 2*idx + 1 + (val & 1)
             self.instrs.append({"valu": [
                 ("&", v_tmp1[p[0]], v_val[c[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[c[0]], v_one),
                 ("&", v_tmp1[p[1]], v_val[c[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[c[1]], v_one),
