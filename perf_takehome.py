@@ -483,18 +483,17 @@ class KernelBuilder:
                 effective_round = round_i - 11
 
             if effective_round == 0:
-                # All indices are 0 - use broadcast of tree[0]
+                # All indices are 0 - broadcast tree[0] once and reuse
+                # Broadcast tree[0] to v_node_val[0] (reuse for all groups)
+                self.instrs.append({"valu": [
+                    ("vbroadcast", v_node_val[0], tmp_node_val),
+                ]})
+
                 for base in range(0, n_chunks, PIPE):
                     c = [base + j for j in range(PIPE)]
                     p = [j % PIPE for j in range(PIPE)]
 
-                    # Broadcast tree[0] and set idx=0
-                    self.instrs.append({"valu": [
-                        ("vbroadcast", v_node_val[p[0]], tmp_node_val),
-                        ("vbroadcast", v_node_val[p[1]], tmp_node_val),
-                        ("vbroadcast", v_node_val[p[2]], tmp_node_val),
-                        ("vbroadcast", v_node_val[p[3]], tmp_node_val),
-                    ]})
+                    # Set idx=0 for all chunks
                     self.instrs.append({"valu": [
                         ("+", v_idx[c[0]], v_zero, v_zero),
                         ("+", v_idx[c[1]], v_zero, v_zero),
@@ -502,12 +501,12 @@ class KernelBuilder:
                         ("+", v_idx[c[3]], v_zero, v_zero),
                     ]})
 
-                    # XOR + Hash
+                    # XOR with tree[0] (using pre-broadcast v_node_val[0])
                     self.instrs.append({"valu": [
-                        ("^", v_val[c[0]], v_val[c[0]], v_node_val[p[0]]),
-                        ("^", v_val[c[1]], v_val[c[1]], v_node_val[p[1]]),
-                        ("^", v_val[c[2]], v_val[c[2]], v_node_val[p[2]]),
-                        ("^", v_val[c[3]], v_val[c[3]], v_node_val[p[3]]),
+                        ("^", v_val[c[0]], v_val[c[0]], v_node_val[0]),
+                        ("^", v_val[c[1]], v_val[c[1]], v_node_val[0]),
+                        ("^", v_val[c[2]], v_val[c[2]], v_node_val[0]),
+                        ("^", v_val[c[3]], v_val[c[3]], v_node_val[0]),
                     ]})
                     emit_hash_and_index(c, p)
 
