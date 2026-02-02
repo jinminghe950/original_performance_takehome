@@ -93,14 +93,13 @@ class KernelBuilder:
         This avoids intermediate memory traffic between rounds.
         """
         n_chunks = batch_size // VLEN  # 32 chunks
-        PIPE = 4  # Process 4 chunks in parallel
+        PIPE = 8  # Process 8 chunks in parallel (maximizes load/compute overlap)
 
         # Allocate vector buffers for ALL 32 chunks (persistent across rounds)
         v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(n_chunks)]
         v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(n_chunks)]
 
         # Working buffers - double buffer for pipelining (A and B sets)
-        # For PIPE=8, we need larger buffers
         v_node_val_A = [self.alloc_scratch(f"v_node_val_A_{i}", VLEN) for i in range(PIPE)]
         v_node_val_B = [self.alloc_scratch(f"v_node_val_B_{i}", VLEN) for i in range(PIPE)]
         v_tmp1 = [self.alloc_scratch(f"v_tmp1_{i}", VLEN) for i in range(PIPE)]
@@ -260,6 +259,91 @@ class KernelBuilder:
             ("vbroadcast", v_tree_level3[7], tmp_tree[7]),
         ]})
 
+        # Helper to emit 6-packed hash for 8 chunks
+        def emit_hash_8(c, p):
+            """Emit hash for 8 chunks using 6 VALU slots per cycle"""
+            for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
+                # op1+op3 for chunks 0-2 (6 ops)
+                self.instrs.append({"valu": [
+                    (op1, v_tmp1[p[0]], v_val[c[0]], v_c1), (op3, v_tmp2[p[0]], v_val[c[0]], v_c3),
+                    (op1, v_tmp1[p[1]], v_val[c[1]], v_c1), (op3, v_tmp2[p[1]], v_val[c[1]], v_c3),
+                    (op1, v_tmp1[p[2]], v_val[c[2]], v_c1), (op3, v_tmp2[p[2]], v_val[c[2]], v_c3),
+                ]})
+                # op1+op3 for chunks 3-5 (6 ops)
+                self.instrs.append({"valu": [
+                    (op1, v_tmp1[p[3]], v_val[c[3]], v_c1), (op3, v_tmp2[p[3]], v_val[c[3]], v_c3),
+                    (op1, v_tmp1[p[4]], v_val[c[4]], v_c1), (op3, v_tmp2[p[4]], v_val[c[4]], v_c3),
+                    (op1, v_tmp1[p[5]], v_val[c[5]], v_c1), (op3, v_tmp2[p[5]], v_val[c[5]], v_c3),
+                ]})
+                # op1+op3 for chunks 6-7, op2 for 0-3 (6 ops)
+                self.instrs.append({"valu": [
+                    (op1, v_tmp1[p[6]], v_val[c[6]], v_c1), (op3, v_tmp2[p[6]], v_val[c[6]], v_c3),
+                    (op1, v_tmp1[p[7]], v_val[c[7]], v_c1), (op3, v_tmp2[p[7]], v_val[c[7]], v_c3),
+                    (op2, v_val[c[0]], v_tmp1[p[0]], v_tmp2[p[0]]),
+                    (op2, v_val[c[1]], v_tmp1[p[1]], v_tmp2[p[1]]),
+                ]})
+                # op2 for chunks 2-7 (6 ops)
+                self.instrs.append({"valu": [
+                    (op2, v_val[c[2]], v_tmp1[p[2]], v_tmp2[p[2]]),
+                    (op2, v_val[c[3]], v_tmp1[p[3]], v_tmp2[p[3]]),
+                    (op2, v_val[c[4]], v_tmp1[p[4]], v_tmp2[p[4]]),
+                    (op2, v_val[c[5]], v_tmp1[p[5]], v_tmp2[p[5]]),
+                    (op2, v_val[c[6]], v_tmp1[p[6]], v_tmp2[p[6]]),
+                    (op2, v_val[c[7]], v_tmp1[p[7]], v_tmp2[p[7]]),
+                ]})
+
+        # Helper to emit 6-packed index computation for 8 chunks
+        def emit_index_8(c, p):
+            """Emit index computation for 8 chunks using 6 VALU slots per cycle"""
+            # bit = val & 1, shifted = idx << 1 for chunks 0-2 (6 ops)
+            self.instrs.append({"valu": [
+                ("&", v_tmp1[p[0]], v_val[c[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[c[0]], v_one),
+                ("&", v_tmp1[p[1]], v_val[c[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[c[1]], v_one),
+                ("&", v_tmp1[p[2]], v_val[c[2]], v_one), ("<<", v_tmp2[p[2]], v_idx[c[2]], v_one),
+            ]})
+            # bit, shifted for chunks 3-5 (6 ops)
+            self.instrs.append({"valu": [
+                ("&", v_tmp1[p[3]], v_val[c[3]], v_one), ("<<", v_tmp2[p[3]], v_idx[c[3]], v_one),
+                ("&", v_tmp1[p[4]], v_val[c[4]], v_one), ("<<", v_tmp2[p[4]], v_idx[c[4]], v_one),
+                ("&", v_tmp1[p[5]], v_val[c[5]], v_one), ("<<", v_tmp2[p[5]], v_idx[c[5]], v_one),
+            ]})
+            # bit, shifted for chunks 6-7, bit+1 for 0-1 (6 ops)
+            self.instrs.append({"valu": [
+                ("&", v_tmp1[p[6]], v_val[c[6]], v_one), ("<<", v_tmp2[p[6]], v_idx[c[6]], v_one),
+                ("&", v_tmp1[p[7]], v_val[c[7]], v_one), ("<<", v_tmp2[p[7]], v_idx[c[7]], v_one),
+                ("+", v_tmp1[p[0]], v_tmp1[p[0]], v_one), ("+", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
+            ]})
+            # bit+1 for chunks 2-7 (6 ops)
+            self.instrs.append({"valu": [
+                ("+", v_tmp1[p[2]], v_tmp1[p[2]], v_one), ("+", v_tmp1[p[3]], v_tmp1[p[3]], v_one),
+                ("+", v_tmp1[p[4]], v_tmp1[p[4]], v_one), ("+", v_tmp1[p[5]], v_tmp1[p[5]], v_one),
+                ("+", v_tmp1[p[6]], v_tmp1[p[6]], v_one), ("+", v_tmp1[p[7]], v_tmp1[p[7]], v_one),
+            ]})
+            # new_idx = shifted + bit for chunks 0-5 (6 ops)
+            self.instrs.append({"valu": [
+                ("+", v_idx[c[0]], v_tmp2[p[0]], v_tmp1[p[0]]), ("+", v_idx[c[1]], v_tmp2[p[1]], v_tmp1[p[1]]),
+                ("+", v_idx[c[2]], v_tmp2[p[2]], v_tmp1[p[2]]), ("+", v_idx[c[3]], v_tmp2[p[3]], v_tmp1[p[3]]),
+                ("+", v_idx[c[4]], v_tmp2[p[4]], v_tmp1[p[4]]), ("+", v_idx[c[5]], v_tmp2[p[5]], v_tmp1[p[5]]),
+            ]})
+            # new_idx for 6-7, cmp for 0-3 (6 ops)
+            self.instrs.append({"valu": [
+                ("+", v_idx[c[6]], v_tmp2[p[6]], v_tmp1[p[6]]), ("+", v_idx[c[7]], v_tmp2[p[7]], v_tmp1[p[7]]),
+                ("<", v_tmp1[p[0]], v_idx[c[0]], v_n_nodes), ("<", v_tmp1[p[1]], v_idx[c[1]], v_n_nodes),
+                ("<", v_tmp1[p[2]], v_idx[c[2]], v_n_nodes), ("<", v_tmp1[p[3]], v_idx[c[3]], v_n_nodes),
+            ]})
+            # cmp for 4-7, mask for 0-1 (6 ops)
+            self.instrs.append({"valu": [
+                ("<", v_tmp1[p[4]], v_idx[c[4]], v_n_nodes), ("<", v_tmp1[p[5]], v_idx[c[5]], v_n_nodes),
+                ("<", v_tmp1[p[6]], v_idx[c[6]], v_n_nodes), ("<", v_tmp1[p[7]], v_idx[c[7]], v_n_nodes),
+                ("*", v_idx[c[0]], v_idx[c[0]], v_tmp1[p[0]]), ("*", v_idx[c[1]], v_idx[c[1]], v_tmp1[p[1]]),
+            ]})
+            # mask for 2-7 (6 ops)
+            self.instrs.append({"valu": [
+                ("*", v_idx[c[2]], v_idx[c[2]], v_tmp1[p[2]]), ("*", v_idx[c[3]], v_idx[c[3]], v_tmp1[p[3]]),
+                ("*", v_idx[c[4]], v_idx[c[4]], v_tmp1[p[4]]), ("*", v_idx[c[5]], v_idx[c[5]], v_tmp1[p[5]]),
+                ("*", v_idx[c[6]], v_idx[c[6]], v_tmp1[p[6]]), ("*", v_idx[c[7]], v_idx[c[7]], v_tmp1[p[7]]),
+            ]})
+
         # ========== ROUND 0: Load vals, set idx=0, compute hash - NO stores (keep in scratch) ==========
         self.instrs.append({"load": [("load", tmp_node_val, forest_p)]})
 
@@ -272,75 +356,49 @@ class KernelBuilder:
             self.instrs.append({"load": [("vload", v_val[chunk_i], tmp_addr[0]),
                                          ("vload", v_val[chunk_i + 1], tmp_addr[1])]})
 
-        # Process 4 chunks at a time for round 0
+        # Process 8 chunks at a time for round 0
         for base in range(0, n_chunks, PIPE):
             c = [base + j for j in range(PIPE)]  # Chunk indices
             p = [j % PIPE for j in range(PIPE)]  # Working buffer indices
 
-            # Broadcast node value and set idx=0 for all 4 chunks
+            # Broadcast node value for 8 chunks (2 cycles at 6 ops each, but broadcasts use less)
             self.instrs.append({"valu": [
                 ("vbroadcast", v_node_val[p[0]], tmp_node_val),
                 ("vbroadcast", v_node_val[p[1]], tmp_node_val),
                 ("vbroadcast", v_node_val[p[2]], tmp_node_val),
                 ("vbroadcast", v_node_val[p[3]], tmp_node_val),
+                ("vbroadcast", v_node_val[p[4]], tmp_node_val),
+                ("vbroadcast", v_node_val[p[5]], tmp_node_val),
             ]})
             self.instrs.append({"valu": [
+                ("vbroadcast", v_node_val[p[6]], tmp_node_val),
+                ("vbroadcast", v_node_val[p[7]], tmp_node_val),
                 ("+", v_idx[c[0]], v_zero, v_zero),
                 ("+", v_idx[c[1]], v_zero, v_zero),
                 ("+", v_idx[c[2]], v_zero, v_zero),
                 ("+", v_idx[c[3]], v_zero, v_zero),
             ]})
-
-            # XOR all 4
             self.instrs.append({"valu": [
+                ("+", v_idx[c[4]], v_zero, v_zero),
+                ("+", v_idx[c[5]], v_zero, v_zero),
+                ("+", v_idx[c[6]], v_zero, v_zero),
+                ("+", v_idx[c[7]], v_zero, v_zero),
                 ("^", v_val[c[0]], v_val[c[0]], v_node_val[p[0]]),
                 ("^", v_val[c[1]], v_val[c[1]], v_node_val[p[1]]),
+            ]})
+            self.instrs.append({"valu": [
                 ("^", v_val[c[2]], v_val[c[2]], v_node_val[p[2]]),
                 ("^", v_val[c[3]], v_val[c[3]], v_node_val[p[3]]),
+                ("^", v_val[c[4]], v_val[c[4]], v_node_val[p[4]]),
+                ("^", v_val[c[5]], v_val[c[5]], v_node_val[p[5]]),
+                ("^", v_val[c[6]], v_val[c[6]], v_node_val[p[6]]),
+                ("^", v_val[c[7]], v_val[c[7]], v_node_val[p[7]]),
             ]})
 
-            # Hash all 4 (6 stages × 3 cycles = 18 cycles)
-            for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1[p[0]], v_val[c[0]], v_c1), (op3, v_tmp2[p[0]], v_val[c[0]], v_c3),
-                    (op1, v_tmp1[p[1]], v_val[c[1]], v_c1), (op3, v_tmp2[p[1]], v_val[c[1]], v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1[p[2]], v_val[c[2]], v_c1), (op3, v_tmp2[p[2]], v_val[c[2]], v_c3),
-                    (op1, v_tmp1[p[3]], v_val[c[3]], v_c1), (op3, v_tmp2[p[3]], v_val[c[3]], v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op2, v_val[c[0]], v_tmp1[p[0]], v_tmp2[p[0]]),
-                    (op2, v_val[c[1]], v_tmp1[p[1]], v_tmp2[p[1]]),
-                    (op2, v_val[c[2]], v_tmp1[p[2]], v_tmp2[p[2]]),
-                    (op2, v_val[c[3]], v_tmp1[p[3]], v_tmp2[p[3]]),
-                ]})
-
-            # Index computation for all 4 (6 cycles)
-            self.instrs.append({"valu": [
-                ("&", v_tmp1[p[0]], v_val[c[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[c[0]], v_one),
-                ("&", v_tmp1[p[1]], v_val[c[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[c[1]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("&", v_tmp1[p[2]], v_val[c[2]], v_one), ("<<", v_tmp2[p[2]], v_idx[c[2]], v_one),
-                ("&", v_tmp1[p[3]], v_val[c[3]], v_one), ("<<", v_tmp2[p[3]], v_idx[c[3]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_tmp1[p[0]], v_tmp1[p[0]], v_one), ("+", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
-                ("+", v_tmp1[p[2]], v_tmp1[p[2]], v_one), ("+", v_tmp1[p[3]], v_tmp1[p[3]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_idx[c[0]], v_tmp2[p[0]], v_tmp1[p[0]]), ("+", v_idx[c[1]], v_tmp2[p[1]], v_tmp1[p[1]]),
-                ("+", v_idx[c[2]], v_tmp2[p[2]], v_tmp1[p[2]]), ("+", v_idx[c[3]], v_tmp2[p[3]], v_tmp1[p[3]]),
-            ]})
-            self.instrs.append({"valu": [
-                ("<", v_tmp1[p[0]], v_idx[c[0]], v_n_nodes), ("<", v_tmp1[p[1]], v_idx[c[1]], v_n_nodes),
-                ("<", v_tmp1[p[2]], v_idx[c[2]], v_n_nodes), ("<", v_tmp1[p[3]], v_idx[c[3]], v_n_nodes),
-            ]})
-            self.instrs.append({"valu": [
-                ("*", v_idx[c[0]], v_idx[c[0]], v_tmp1[p[0]]), ("*", v_idx[c[1]], v_idx[c[1]], v_tmp1[p[1]]),
-                ("*", v_idx[c[2]], v_idx[c[2]], v_tmp1[p[2]]), ("*", v_idx[c[3]], v_idx[c[3]], v_tmp1[p[3]]),
-            ]})
+            # Hash all 8 (6 stages × 4 cycles = 24 cycles)
+            emit_hash_8(c, p)
+            # Index computation for all 8 (9 cycles)
+            emit_index_8(c, p)
             # NO STORES - keep results in scratch
 
         # ========== ROUND 1: Indices are 1 or 2 - use arithmetic, keep in scratch ==========
@@ -356,124 +414,67 @@ class KernelBuilder:
             p = [j % PIPE for j in range(PIPE)]
 
             # Compute node_val using arithmetic (idx is 1 or 2)
+            # tmp1 = idx - 1, tmp2 = 2 - idx
             self.instrs.append({"valu": [
                 ("-", v_tmp1[p[0]], v_idx[c[0]], v_one), ("-", v_tmp2[p[0]], v_two, v_idx[c[0]]),
                 ("-", v_tmp1[p[1]], v_idx[c[1]], v_one), ("-", v_tmp2[p[1]], v_two, v_idx[c[1]]),
-            ]})
-            self.instrs.append({"valu": [
                 ("-", v_tmp1[p[2]], v_idx[c[2]], v_one), ("-", v_tmp2[p[2]], v_two, v_idx[c[2]]),
-                ("-", v_tmp1[p[3]], v_idx[c[3]], v_one), ("-", v_tmp2[p[3]], v_two, v_idx[c[3]]),
             ]})
             self.instrs.append({"valu": [
+                ("-", v_tmp1[p[3]], v_idx[c[3]], v_one), ("-", v_tmp2[p[3]], v_two, v_idx[c[3]]),
+                ("-", v_tmp1[p[4]], v_idx[c[4]], v_one), ("-", v_tmp2[p[4]], v_two, v_idx[c[4]]),
+                ("-", v_tmp1[p[5]], v_idx[c[5]], v_one), ("-", v_tmp2[p[5]], v_two, v_idx[c[5]]),
+            ]})
+            self.instrs.append({"valu": [
+                ("-", v_tmp1[p[6]], v_idx[c[6]], v_one), ("-", v_tmp2[p[6]], v_two, v_idx[c[6]]),
+                ("-", v_tmp1[p[7]], v_idx[c[7]], v_one), ("-", v_tmp2[p[7]], v_two, v_idx[c[7]]),
                 ("*", v_node_addr[p[0]], v_tree2, v_tmp1[p[0]]),
                 ("*", v_node_addr[p[1]], v_tree2, v_tmp1[p[1]]),
+            ]})
+            self.instrs.append({"valu": [
                 ("*", v_node_addr[p[2]], v_tree2, v_tmp1[p[2]]),
                 ("*", v_node_addr[p[3]], v_tree2, v_tmp1[p[3]]),
+                ("*", v_node_addr[p[4]], v_tree2, v_tmp1[p[4]]),
+                ("*", v_node_addr[p[5]], v_tree2, v_tmp1[p[5]]),
+                ("*", v_node_addr[p[6]], v_tree2, v_tmp1[p[6]]),
+                ("*", v_node_addr[p[7]], v_tree2, v_tmp1[p[7]]),
             ]})
             self.instrs.append({"valu": [
                 ("multiply_add", v_node_val[p[0]], v_tree1, v_tmp2[p[0]], v_node_addr[p[0]]),
                 ("multiply_add", v_node_val[p[1]], v_tree1, v_tmp2[p[1]], v_node_addr[p[1]]),
                 ("multiply_add", v_node_val[p[2]], v_tree1, v_tmp2[p[2]], v_node_addr[p[2]]),
                 ("multiply_add", v_node_val[p[3]], v_tree1, v_tmp2[p[3]], v_node_addr[p[3]]),
+                ("multiply_add", v_node_val[p[4]], v_tree1, v_tmp2[p[4]], v_node_addr[p[4]]),
+                ("multiply_add", v_node_val[p[5]], v_tree1, v_tmp2[p[5]], v_node_addr[p[5]]),
             ]})
-
-            # XOR + Hash (using persistent buffers)
             self.instrs.append({"valu": [
+                ("multiply_add", v_node_val[p[6]], v_tree1, v_tmp2[p[6]], v_node_addr[p[6]]),
+                ("multiply_add", v_node_val[p[7]], v_tree1, v_tmp2[p[7]], v_node_addr[p[7]]),
                 ("^", v_val[c[0]], v_val[c[0]], v_node_val[p[0]]),
                 ("^", v_val[c[1]], v_val[c[1]], v_node_val[p[1]]),
                 ("^", v_val[c[2]], v_val[c[2]], v_node_val[p[2]]),
                 ("^", v_val[c[3]], v_val[c[3]], v_node_val[p[3]]),
             ]})
-            for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1[p[0]], v_val[c[0]], v_c1), (op3, v_tmp2[p[0]], v_val[c[0]], v_c3),
-                    (op1, v_tmp1[p[1]], v_val[c[1]], v_c1), (op3, v_tmp2[p[1]], v_val[c[1]], v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1[p[2]], v_val[c[2]], v_c1), (op3, v_tmp2[p[2]], v_val[c[2]], v_c3),
-                    (op1, v_tmp1[p[3]], v_val[c[3]], v_c1), (op3, v_tmp2[p[3]], v_val[c[3]], v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op2, v_val[c[0]], v_tmp1[p[0]], v_tmp2[p[0]]),
-                    (op2, v_val[c[1]], v_tmp1[p[1]], v_tmp2[p[1]]),
-                    (op2, v_val[c[2]], v_tmp1[p[2]], v_tmp2[p[2]]),
-                    (op2, v_val[c[3]], v_tmp1[p[3]], v_tmp2[p[3]]),
-                ]})
+            self.instrs.append({"valu": [
+                ("^", v_val[c[4]], v_val[c[4]], v_node_val[p[4]]),
+                ("^", v_val[c[5]], v_val[c[5]], v_node_val[p[5]]),
+                ("^", v_val[c[6]], v_val[c[6]], v_node_val[p[6]]),
+                ("^", v_val[c[7]], v_val[c[7]], v_node_val[p[7]]),
+            ]})
 
-            # Index computation
-            self.instrs.append({"valu": [
-                ("&", v_tmp1[p[0]], v_val[c[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[c[0]], v_one),
-                ("&", v_tmp1[p[1]], v_val[c[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[c[1]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("&", v_tmp1[p[2]], v_val[c[2]], v_one), ("<<", v_tmp2[p[2]], v_idx[c[2]], v_one),
-                ("&", v_tmp1[p[3]], v_val[c[3]], v_one), ("<<", v_tmp2[p[3]], v_idx[c[3]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_tmp1[p[0]], v_tmp1[p[0]], v_one), ("+", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
-                ("+", v_tmp1[p[2]], v_tmp1[p[2]], v_one), ("+", v_tmp1[p[3]], v_tmp1[p[3]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_idx[c[0]], v_tmp2[p[0]], v_tmp1[p[0]]), ("+", v_idx[c[1]], v_tmp2[p[1]], v_tmp1[p[1]]),
-                ("+", v_idx[c[2]], v_tmp2[p[2]], v_tmp1[p[2]]), ("+", v_idx[c[3]], v_tmp2[p[3]], v_tmp1[p[3]]),
-            ]})
-            self.instrs.append({"valu": [
-                ("<", v_tmp1[p[0]], v_idx[c[0]], v_n_nodes), ("<", v_tmp1[p[1]], v_idx[c[1]], v_n_nodes),
-                ("<", v_tmp1[p[2]], v_idx[c[2]], v_n_nodes), ("<", v_tmp1[p[3]], v_idx[c[3]], v_n_nodes),
-            ]})
-            self.instrs.append({"valu": [
-                ("*", v_idx[c[0]], v_idx[c[0]], v_tmp1[p[0]]), ("*", v_idx[c[1]], v_idx[c[1]], v_tmp1[p[1]]),
-                ("*", v_idx[c[2]], v_idx[c[2]], v_tmp1[p[2]]), ("*", v_idx[c[3]], v_idx[c[3]], v_tmp1[p[3]]),
-            ]})
+            # Hash and index
+            emit_hash_8(c, p)
+            emit_index_8(c, p)
             # NO STORES - keep in scratch
 
         # ========== ROUNDS 2+: Different handling based on round number ==========
         # Due to tree wrapping at n_nodes, after round 10 all indices reset to 0
         # Round 11 = like round 0, Round 12 = like round 1, etc.
 
-        def emit_hash_and_index(c, p):
-            """Emit hash and index computation for 4 chunks"""
-            for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1[p[0]], v_val[c[0]], v_c1), (op3, v_tmp2[p[0]], v_val[c[0]], v_c3),
-                    (op1, v_tmp1[p[1]], v_val[c[1]], v_c1), (op3, v_tmp2[p[1]], v_val[c[1]], v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1[p[2]], v_val[c[2]], v_c1), (op3, v_tmp2[p[2]], v_val[c[2]], v_c3),
-                    (op1, v_tmp1[p[3]], v_val[c[3]], v_c1), (op3, v_tmp2[p[3]], v_val[c[3]], v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op2, v_val[c[0]], v_tmp1[p[0]], v_tmp2[p[0]]),
-                    (op2, v_val[c[1]], v_tmp1[p[1]], v_tmp2[p[1]]),
-                    (op2, v_val[c[2]], v_tmp1[p[2]], v_tmp2[p[2]]),
-                    (op2, v_val[c[3]], v_tmp1[p[3]], v_tmp2[p[3]]),
-                ]})
-
-            # Index computation: new_idx = 2*idx + 1 + (val & 1)
-            self.instrs.append({"valu": [
-                ("&", v_tmp1[p[0]], v_val[c[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[c[0]], v_one),
-                ("&", v_tmp1[p[1]], v_val[c[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[c[1]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("&", v_tmp1[p[2]], v_val[c[2]], v_one), ("<<", v_tmp2[p[2]], v_idx[c[2]], v_one),
-                ("&", v_tmp1[p[3]], v_val[c[3]], v_one), ("<<", v_tmp2[p[3]], v_idx[c[3]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_tmp1[p[0]], v_tmp1[p[0]], v_one), ("+", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
-                ("+", v_tmp1[p[2]], v_tmp1[p[2]], v_one), ("+", v_tmp1[p[3]], v_tmp1[p[3]], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_idx[c[0]], v_tmp2[p[0]], v_tmp1[p[0]]), ("+", v_idx[c[1]], v_tmp2[p[1]], v_tmp1[p[1]]),
-                ("+", v_idx[c[2]], v_tmp2[p[2]], v_tmp1[p[2]]), ("+", v_idx[c[3]], v_tmp2[p[3]], v_tmp1[p[3]]),
-            ]})
-            self.instrs.append({"valu": [
-                ("<", v_tmp1[p[0]], v_idx[c[0]], v_n_nodes), ("<", v_tmp1[p[1]], v_idx[c[1]], v_n_nodes),
-                ("<", v_tmp1[p[2]], v_idx[c[2]], v_n_nodes), ("<", v_tmp1[p[3]], v_idx[c[3]], v_n_nodes),
-            ]})
-            self.instrs.append({"valu": [
-                ("*", v_idx[c[0]], v_idx[c[0]], v_tmp1[p[0]]), ("*", v_idx[c[1]], v_idx[c[1]], v_tmp1[p[1]]),
-                ("*", v_idx[c[2]], v_idx[c[2]], v_tmp1[p[2]]), ("*", v_idx[c[3]], v_idx[c[3]], v_tmp1[p[3]]),
-            ]})
+        def emit_hash_and_index_8(c, p):
+            """Emit hash and index computation for 8 chunks with 6-packed VALU"""
+            emit_hash_8(c, p)
+            emit_index_8(c, p)
 
         for round_i in range(2, rounds):
             # Determine effective round after considering tree wrap
@@ -484,138 +485,192 @@ class KernelBuilder:
 
             if effective_round == 0:
                 # All indices are 0 - broadcast tree[0] once and reuse
-                # Broadcast tree[0] to v_node_val[0] (reuse for all groups)
-                self.instrs.append({"valu": [
-                    ("vbroadcast", v_node_val[0], tmp_node_val),
-                ]})
+                self.instrs.append({"valu": [("vbroadcast", v_node_val[0], tmp_node_val)]})
 
                 for base in range(0, n_chunks, PIPE):
                     c = [base + j for j in range(PIPE)]
                     p = [j % PIPE for j in range(PIPE)]
 
-                    # Set idx=0 for all chunks
+                    # Set idx=0 and XOR with tree[0] for all 8 chunks
                     self.instrs.append({"valu": [
-                        ("+", v_idx[c[0]], v_zero, v_zero),
-                        ("+", v_idx[c[1]], v_zero, v_zero),
-                        ("+", v_idx[c[2]], v_zero, v_zero),
-                        ("+", v_idx[c[3]], v_zero, v_zero),
+                        ("+", v_idx[c[0]], v_zero, v_zero), ("+", v_idx[c[1]], v_zero, v_zero),
+                        ("+", v_idx[c[2]], v_zero, v_zero), ("+", v_idx[c[3]], v_zero, v_zero),
+                        ("+", v_idx[c[4]], v_zero, v_zero), ("+", v_idx[c[5]], v_zero, v_zero),
                     ]})
-
-                    # XOR with tree[0] (using pre-broadcast v_node_val[0])
                     self.instrs.append({"valu": [
+                        ("+", v_idx[c[6]], v_zero, v_zero), ("+", v_idx[c[7]], v_zero, v_zero),
                         ("^", v_val[c[0]], v_val[c[0]], v_node_val[0]),
                         ("^", v_val[c[1]], v_val[c[1]], v_node_val[0]),
                         ("^", v_val[c[2]], v_val[c[2]], v_node_val[0]),
                         ("^", v_val[c[3]], v_val[c[3]], v_node_val[0]),
                     ]})
-                    emit_hash_and_index(c, p)
+                    self.instrs.append({"valu": [
+                        ("^", v_val[c[4]], v_val[c[4]], v_node_val[0]),
+                        ("^", v_val[c[5]], v_val[c[5]], v_node_val[0]),
+                        ("^", v_val[c[6]], v_val[c[6]], v_node_val[0]),
+                        ("^", v_val[c[7]], v_val[c[7]], v_node_val[0]),
+                    ]})
+                    emit_hash_and_index_8(c, p)
 
             elif effective_round == 1:
-                # Indices are 1 or 2 - use arithmetic selection (like round 1)
+                # Indices are 1 or 2 - use arithmetic selection
                 for base in range(0, n_chunks, PIPE):
                     c = [base + j for j in range(PIPE)]
                     p = [j % PIPE for j in range(PIPE)]
 
-                    # Compute node_val using arithmetic (idx is 1 or 2)
+                    # tmp1 = idx - 1, tmp2 = 2 - idx
                     self.instrs.append({"valu": [
                         ("-", v_tmp1[p[0]], v_idx[c[0]], v_one), ("-", v_tmp2[p[0]], v_two, v_idx[c[0]]),
                         ("-", v_tmp1[p[1]], v_idx[c[1]], v_one), ("-", v_tmp2[p[1]], v_two, v_idx[c[1]]),
-                    ]})
-                    self.instrs.append({"valu": [
                         ("-", v_tmp1[p[2]], v_idx[c[2]], v_one), ("-", v_tmp2[p[2]], v_two, v_idx[c[2]]),
-                        ("-", v_tmp1[p[3]], v_idx[c[3]], v_one), ("-", v_tmp2[p[3]], v_two, v_idx[c[3]]),
                     ]})
                     self.instrs.append({"valu": [
+                        ("-", v_tmp1[p[3]], v_idx[c[3]], v_one), ("-", v_tmp2[p[3]], v_two, v_idx[c[3]]),
+                        ("-", v_tmp1[p[4]], v_idx[c[4]], v_one), ("-", v_tmp2[p[4]], v_two, v_idx[c[4]]),
+                        ("-", v_tmp1[p[5]], v_idx[c[5]], v_one), ("-", v_tmp2[p[5]], v_two, v_idx[c[5]]),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("-", v_tmp1[p[6]], v_idx[c[6]], v_one), ("-", v_tmp2[p[6]], v_two, v_idx[c[6]]),
+                        ("-", v_tmp1[p[7]], v_idx[c[7]], v_one), ("-", v_tmp2[p[7]], v_two, v_idx[c[7]]),
                         ("*", v_node_addr[p[0]], v_tree2, v_tmp1[p[0]]),
                         ("*", v_node_addr[p[1]], v_tree2, v_tmp1[p[1]]),
+                    ]})
+                    self.instrs.append({"valu": [
                         ("*", v_node_addr[p[2]], v_tree2, v_tmp1[p[2]]),
                         ("*", v_node_addr[p[3]], v_tree2, v_tmp1[p[3]]),
+                        ("*", v_node_addr[p[4]], v_tree2, v_tmp1[p[4]]),
+                        ("*", v_node_addr[p[5]], v_tree2, v_tmp1[p[5]]),
+                        ("*", v_node_addr[p[6]], v_tree2, v_tmp1[p[6]]),
+                        ("*", v_node_addr[p[7]], v_tree2, v_tmp1[p[7]]),
                     ]})
                     self.instrs.append({"valu": [
                         ("multiply_add", v_node_val[p[0]], v_tree1, v_tmp2[p[0]], v_node_addr[p[0]]),
                         ("multiply_add", v_node_val[p[1]], v_tree1, v_tmp2[p[1]], v_node_addr[p[1]]),
                         ("multiply_add", v_node_val[p[2]], v_tree1, v_tmp2[p[2]], v_node_addr[p[2]]),
                         ("multiply_add", v_node_val[p[3]], v_tree1, v_tmp2[p[3]], v_node_addr[p[3]]),
+                        ("multiply_add", v_node_val[p[4]], v_tree1, v_tmp2[p[4]], v_node_addr[p[4]]),
+                        ("multiply_add", v_node_val[p[5]], v_tree1, v_tmp2[p[5]], v_node_addr[p[5]]),
                     ]})
-
-                    # XOR + Hash
                     self.instrs.append({"valu": [
+                        ("multiply_add", v_node_val[p[6]], v_tree1, v_tmp2[p[6]], v_node_addr[p[6]]),
+                        ("multiply_add", v_node_val[p[7]], v_tree1, v_tmp2[p[7]], v_node_addr[p[7]]),
                         ("^", v_val[c[0]], v_val[c[0]], v_node_val[p[0]]),
                         ("^", v_val[c[1]], v_val[c[1]], v_node_val[p[1]]),
                         ("^", v_val[c[2]], v_val[c[2]], v_node_val[p[2]]),
                         ("^", v_val[c[3]], v_val[c[3]], v_node_val[p[3]]),
                     ]})
-                    emit_hash_and_index(c, p)
+                    self.instrs.append({"valu": [
+                        ("^", v_val[c[4]], v_val[c[4]], v_node_val[p[4]]),
+                        ("^", v_val[c[5]], v_val[c[5]], v_node_val[p[5]]),
+                        ("^", v_val[c[6]], v_val[c[6]], v_node_val[p[6]]),
+                        ("^", v_val[c[7]], v_val[c[7]], v_node_val[p[7]]),
+                    ]})
+                    emit_hash_and_index_8(c, p)
 
             elif effective_round == 2:
-                # Indices are 3, 4, 5, or 6 - use arithmetic selection from 4 values
+                # Indices are 3-6 - use 4-value arithmetic selection
                 for base in range(0, n_chunks, PIPE):
                     c = [base + j for j in range(PIPE)]
                     p = [j % PIPE for j in range(PIPE)]
 
-                    # Compute offset = idx - 3, then select using bit operations
-                    # bit0 = offset & 1, bit1 = offset >> 1
-                    # result = (tree3*(1-bit0) + tree4*bit0)*(1-bit1) + (tree5*(1-bit0) + tree6*bit0)*bit1
+                    # offset = idx - 3, bit0 = offset & 1, bit1 = offset >> 1
                     self.instrs.append({"valu": [
-                        ("-", v_tmp1[p[0]], v_idx[c[0]], v_three),  # offset
+                        ("-", v_tmp1[p[0]], v_idx[c[0]], v_three),
                         ("-", v_tmp1[p[1]], v_idx[c[1]], v_three),
                         ("-", v_tmp1[p[2]], v_idx[c[2]], v_three),
                         ("-", v_tmp1[p[3]], v_idx[c[3]], v_three),
+                        ("-", v_tmp1[p[4]], v_idx[c[4]], v_three),
+                        ("-", v_tmp1[p[5]], v_idx[c[5]], v_three),
                     ]})
-                    # bit0 = offset & 1
                     self.instrs.append({"valu": [
+                        ("-", v_tmp1[p[6]], v_idx[c[6]], v_three),
+                        ("-", v_tmp1[p[7]], v_idx[c[7]], v_three),
                         ("&", v_tmp2[p[0]], v_tmp1[p[0]], v_one),
                         ("&", v_tmp2[p[1]], v_tmp1[p[1]], v_one),
                         ("&", v_tmp2[p[2]], v_tmp1[p[2]], v_one),
                         ("&", v_tmp2[p[3]], v_tmp1[p[3]], v_one),
                     ]})
-                    # bit1 = offset >> 1
                     self.instrs.append({"valu": [
+                        ("&", v_tmp2[p[4]], v_tmp1[p[4]], v_one),
+                        ("&", v_tmp2[p[5]], v_tmp1[p[5]], v_one),
+                        ("&", v_tmp2[p[6]], v_tmp1[p[6]], v_one),
+                        ("&", v_tmp2[p[7]], v_tmp1[p[7]], v_one),
                         (">>", v_tmp1[p[0]], v_tmp1[p[0]], v_one),
                         (">>", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
+                    ]})
+                    self.instrs.append({"valu": [
                         (">>", v_tmp1[p[2]], v_tmp1[p[2]], v_one),
                         (">>", v_tmp1[p[3]], v_tmp1[p[3]], v_one),
+                        (">>", v_tmp1[p[4]], v_tmp1[p[4]], v_one),
+                        (">>", v_tmp1[p[5]], v_tmp1[p[5]], v_one),
+                        (">>", v_tmp1[p[6]], v_tmp1[p[6]], v_one),
+                        (">>", v_tmp1[p[7]], v_tmp1[p[7]], v_one),
                     ]})
-                    # inv_bit0 = 1 - bit0 (store in v_node_addr)
+                    # inv_bit0 = 1 - bit0
                     self.instrs.append({"valu": [
                         ("-", v_node_addr[p[0]], v_one, v_tmp2[p[0]]),
                         ("-", v_node_addr[p[1]], v_one, v_tmp2[p[1]]),
                         ("-", v_node_addr[p[2]], v_one, v_tmp2[p[2]]),
                         ("-", v_node_addr[p[3]], v_one, v_tmp2[p[3]]),
+                        ("-", v_node_addr[p[4]], v_one, v_tmp2[p[4]]),
+                        ("-", v_node_addr[p[5]], v_one, v_tmp2[p[5]]),
                     ]})
-                    # first_half = tree3 * inv_bit0 + tree4 * bit0
-                    # Use v_node_val temporarily for tree3*inv_bit0
                     self.instrs.append({"valu": [
+                        ("-", v_node_addr[p[6]], v_one, v_tmp2[p[6]]),
+                        ("-", v_node_addr[p[7]], v_one, v_tmp2[p[7]]),
                         ("*", v_node_val[p[0]], v_tree3, v_node_addr[p[0]]),
                         ("*", v_node_val[p[1]], v_tree3, v_node_addr[p[1]]),
                         ("*", v_node_val[p[2]], v_tree3, v_node_addr[p[2]]),
                         ("*", v_node_val[p[3]], v_tree3, v_node_addr[p[3]]),
                     ]})
                     self.instrs.append({"valu": [
+                        ("*", v_node_val[p[4]], v_tree3, v_node_addr[p[4]]),
+                        ("*", v_node_val[p[5]], v_tree3, v_node_addr[p[5]]),
+                        ("*", v_node_val[p[6]], v_tree3, v_node_addr[p[6]]),
+                        ("*", v_node_val[p[7]], v_tree3, v_node_addr[p[7]]),
                         ("multiply_add", v_node_val[p[0]], v_tree4, v_tmp2[p[0]], v_node_val[p[0]]),
                         ("multiply_add", v_node_val[p[1]], v_tree4, v_tmp2[p[1]], v_node_val[p[1]]),
+                    ]})
+                    self.instrs.append({"valu": [
                         ("multiply_add", v_node_val[p[2]], v_tree4, v_tmp2[p[2]], v_node_val[p[2]]),
                         ("multiply_add", v_node_val[p[3]], v_tree4, v_tmp2[p[3]], v_node_val[p[3]]),
+                        ("multiply_add", v_node_val[p[4]], v_tree4, v_tmp2[p[4]], v_node_val[p[4]]),
+                        ("multiply_add", v_node_val[p[5]], v_tree4, v_tmp2[p[5]], v_node_val[p[5]]),
+                        ("multiply_add", v_node_val[p[6]], v_tree4, v_tmp2[p[6]], v_node_val[p[6]]),
+                        ("multiply_add", v_node_val[p[7]], v_tree4, v_tmp2[p[7]], v_node_val[p[7]]),
                     ]})
-                    # second_half = tree5 * inv_bit0 + tree6 * bit0 (reuse v_node_addr for result)
+                    # second_half = tree5 * inv_bit0 + tree6 * bit0
                     self.instrs.append({"valu": [
                         ("*", v_node_addr[p[0]], v_tree5, v_node_addr[p[0]]),
                         ("*", v_node_addr[p[1]], v_tree5, v_node_addr[p[1]]),
                         ("*", v_node_addr[p[2]], v_tree5, v_node_addr[p[2]]),
                         ("*", v_node_addr[p[3]], v_tree5, v_node_addr[p[3]]),
+                        ("*", v_node_addr[p[4]], v_tree5, v_node_addr[p[4]]),
+                        ("*", v_node_addr[p[5]], v_tree5, v_node_addr[p[5]]),
                     ]})
                     self.instrs.append({"valu": [
+                        ("*", v_node_addr[p[6]], v_tree5, v_node_addr[p[6]]),
+                        ("*", v_node_addr[p[7]], v_tree5, v_node_addr[p[7]]),
                         ("multiply_add", v_node_addr[p[0]], v_tree6, v_tmp2[p[0]], v_node_addr[p[0]]),
                         ("multiply_add", v_node_addr[p[1]], v_tree6, v_tmp2[p[1]], v_node_addr[p[1]]),
                         ("multiply_add", v_node_addr[p[2]], v_tree6, v_tmp2[p[2]], v_node_addr[p[2]]),
                         ("multiply_add", v_node_addr[p[3]], v_tree6, v_tmp2[p[3]], v_node_addr[p[3]]),
                     ]})
-                    # inv_bit1 = 1 - bit1 (reuse v_tmp2)
                     self.instrs.append({"valu": [
+                        ("multiply_add", v_node_addr[p[4]], v_tree6, v_tmp2[p[4]], v_node_addr[p[4]]),
+                        ("multiply_add", v_node_addr[p[5]], v_tree6, v_tmp2[p[5]], v_node_addr[p[5]]),
+                        ("multiply_add", v_node_addr[p[6]], v_tree6, v_tmp2[p[6]], v_node_addr[p[6]]),
+                        ("multiply_add", v_node_addr[p[7]], v_tree6, v_tmp2[p[7]], v_node_addr[p[7]]),
                         ("-", v_tmp2[p[0]], v_one, v_tmp1[p[0]]),
                         ("-", v_tmp2[p[1]], v_one, v_tmp1[p[1]]),
+                    ]})
+                    self.instrs.append({"valu": [
                         ("-", v_tmp2[p[2]], v_one, v_tmp1[p[2]]),
                         ("-", v_tmp2[p[3]], v_one, v_tmp1[p[3]]),
+                        ("-", v_tmp2[p[4]], v_one, v_tmp1[p[4]]),
+                        ("-", v_tmp2[p[5]], v_one, v_tmp1[p[5]]),
+                        ("-", v_tmp2[p[6]], v_one, v_tmp1[p[6]]),
+                        ("-", v_tmp2[p[7]], v_one, v_tmp1[p[7]]),
                     ]})
                     # result = first_half * inv_bit1 + second_half * bit1
                     self.instrs.append({"valu": [
@@ -623,48 +678,91 @@ class KernelBuilder:
                         ("*", v_node_val[p[1]], v_node_val[p[1]], v_tmp2[p[1]]),
                         ("*", v_node_val[p[2]], v_node_val[p[2]], v_tmp2[p[2]]),
                         ("*", v_node_val[p[3]], v_node_val[p[3]], v_tmp2[p[3]]),
+                        ("*", v_node_val[p[4]], v_node_val[p[4]], v_tmp2[p[4]]),
+                        ("*", v_node_val[p[5]], v_node_val[p[5]], v_tmp2[p[5]]),
                     ]})
                     self.instrs.append({"valu": [
+                        ("*", v_node_val[p[6]], v_node_val[p[6]], v_tmp2[p[6]]),
+                        ("*", v_node_val[p[7]], v_node_val[p[7]], v_tmp2[p[7]]),
                         ("multiply_add", v_node_val[p[0]], v_node_addr[p[0]], v_tmp1[p[0]], v_node_val[p[0]]),
                         ("multiply_add", v_node_val[p[1]], v_node_addr[p[1]], v_tmp1[p[1]], v_node_val[p[1]]),
                         ("multiply_add", v_node_val[p[2]], v_node_addr[p[2]], v_tmp1[p[2]], v_node_val[p[2]]),
                         ("multiply_add", v_node_val[p[3]], v_node_addr[p[3]], v_tmp1[p[3]], v_node_val[p[3]]),
                     ]})
-
-                    # XOR + Hash
                     self.instrs.append({"valu": [
+                        ("multiply_add", v_node_val[p[4]], v_node_addr[p[4]], v_tmp1[p[4]], v_node_val[p[4]]),
+                        ("multiply_add", v_node_val[p[5]], v_node_addr[p[5]], v_tmp1[p[5]], v_node_val[p[5]]),
+                        ("multiply_add", v_node_val[p[6]], v_node_addr[p[6]], v_tmp1[p[6]], v_node_val[p[6]]),
+                        ("multiply_add", v_node_val[p[7]], v_node_addr[p[7]], v_tmp1[p[7]], v_node_val[p[7]]),
                         ("^", v_val[c[0]], v_val[c[0]], v_node_val[p[0]]),
                         ("^", v_val[c[1]], v_val[c[1]], v_node_val[p[1]]),
+                    ]})
+                    self.instrs.append({"valu": [
                         ("^", v_val[c[2]], v_val[c[2]], v_node_val[p[2]]),
                         ("^", v_val[c[3]], v_val[c[3]], v_node_val[p[3]]),
+                        ("^", v_val[c[4]], v_val[c[4]], v_node_val[p[4]]),
+                        ("^", v_val[c[5]], v_val[c[5]], v_node_val[p[5]]),
+                        ("^", v_val[c[6]], v_val[c[6]], v_node_val[p[6]]),
+                        ("^", v_val[c[7]], v_val[c[7]], v_node_val[p[7]]),
                     ]})
-                    emit_hash_and_index(c, p)
+                    emit_hash_and_index_8(c, p)
 
             else:
-                # General case: use pipelined scattered loads
-                # Overlap hash of group N with loads of group N+1
-                n_groups = n_chunks // PIPE  # 8 groups
+                # General case: use pipelined scattered loads for 8 chunks
+                n_groups = n_chunks // PIPE  # 4 groups with PIPE=8
 
-                # First group: just load (no prior hash to overlap with)
-                base = 0
-                c = [base + j for j in range(PIPE)]
+                # We use v_node_addr_A for groups 0, 2 and v_node_addr_B for groups 1, 3
+                # Precompute all addresses upfront during first group's loads
+
+                c0 = [j for j in range(PIPE)]           # Group 0: chunks 0-7
+                c1 = [8 + j for j in range(PIPE)]       # Group 1: chunks 8-15
+                c2 = [16 + j for j in range(PIPE)]      # Group 2: chunks 16-23
+                c3 = [24 + j for j in range(PIPE)]      # Group 3: chunks 24-31
                 p = [j % PIPE for j in range(PIPE)]
 
-                # Compute addresses and start loading for first group into buffer A
+                # First 2 cycles: compute addresses for group 0 (into A)
                 self.instrs.append({"valu": [
-                    ("+", v_node_addr_A[p[0]], v_idx[c[0]], v_forest_p),
-                    ("+", v_node_addr_A[p[1]], v_idx[c[1]], v_forest_p),
-                    ("+", v_node_addr_A[p[2]], v_idx[c[2]], v_forest_p),
-                    ("+", v_node_addr_A[p[3]], v_idx[c[3]], v_forest_p),
+                    ("+", v_node_addr_A[p[0]], v_idx[c0[0]], v_forest_p),
+                    ("+", v_node_addr_A[p[1]], v_idx[c0[1]], v_forest_p),
+                    ("+", v_node_addr_A[p[2]], v_idx[c0[2]], v_forest_p),
+                    ("+", v_node_addr_A[p[3]], v_idx[c0[3]], v_forest_p),
+                    ("+", v_node_addr_A[p[4]], v_idx[c0[4]], v_forest_p),
+                    ("+", v_node_addr_A[p[5]], v_idx[c0[5]], v_forest_p),
                 ]})
-                for chunk in range(4):
+                self.instrs.append({"valu": [
+                    ("+", v_node_addr_A[p[6]], v_idx[c0[6]], v_forest_p),
+                    ("+", v_node_addr_A[p[7]], v_idx[c0[7]], v_forest_p),
+                ]})
+
+                # Load first group while computing addresses for groups 1, 2, 3
+                load_idx = 0
+                for chunk in range(8):
                     for pair in range(4):
-                        self.instrs.append({"load": [
+                        instr = {"load": [
                             ("load_offset", v_node_val_A[p[chunk]], v_node_addr_A[p[chunk]], pair*2),
                             ("load_offset", v_node_val_A[p[chunk]], v_node_addr_A[p[chunk]], pair*2+1)
-                        ]})
+                        ]}
+                        # Overlap with address computation for groups 1, 2, 3
+                        if load_idx == 0:
+                            instr["valu"] = [
+                                ("+", v_node_addr_B[p[0]], v_idx[c1[0]], v_forest_p),
+                                ("+", v_node_addr_B[p[1]], v_idx[c1[1]], v_forest_p),
+                                ("+", v_node_addr_B[p[2]], v_idx[c1[2]], v_forest_p),
+                                ("+", v_node_addr_B[p[3]], v_idx[c1[3]], v_forest_p),
+                                ("+", v_node_addr_B[p[4]], v_idx[c1[4]], v_forest_p),
+                                ("+", v_node_addr_B[p[5]], v_idx[c1[5]], v_forest_p),
+                            ]
+                        elif load_idx == 1:
+                            instr["valu"] = [
+                                ("+", v_node_addr_B[p[6]], v_idx[c1[6]], v_forest_p),
+                                ("+", v_node_addr_B[p[7]], v_idx[c1[7]], v_forest_p),
+                            ]
+                        # Note: Groups 2, 3 addresses will be computed later during group 0-1 processing
+                        load_idx += 1
+                        self.instrs.append(instr)
 
                 # Middle groups: overlap hash of current with loads of next
+                # With PIPE=8: 32 load cycles needed, ~33 VALU cycles available (hash=24 + index=9)
                 for group_i in range(n_groups - 1):
                     curr_base = group_i * PIPE
                     next_base = (group_i + 1) * PIPE
@@ -680,46 +778,41 @@ class KernelBuilder:
                         curr_val, curr_addr = v_node_val_B, v_node_addr_B
                         next_val, next_addr = v_node_val_A, v_node_addr_A
 
-                    # Prepare next group's addresses
+                    # Prepare next group's addresses (2 cycles)
                     self.instrs.append({"valu": [
                         ("+", next_addr[p[0]], v_idx[next_c[0]], v_forest_p),
                         ("+", next_addr[p[1]], v_idx[next_c[1]], v_forest_p),
                         ("+", next_addr[p[2]], v_idx[next_c[2]], v_forest_p),
                         ("+", next_addr[p[3]], v_idx[next_c[3]], v_forest_p),
+                        ("+", next_addr[p[4]], v_idx[next_c[4]], v_forest_p),
+                        ("+", next_addr[p[5]], v_idx[next_c[5]], v_forest_p),
                     ]})
-
-                    # XOR for current group
                     self.instrs.append({"valu": [
+                        ("+", next_addr[p[6]], v_idx[next_c[6]], v_forest_p),
+                        ("+", next_addr[p[7]], v_idx[next_c[7]], v_forest_p),
                         ("^", v_val[curr_c[0]], v_val[curr_c[0]], curr_val[p[0]]),
                         ("^", v_val[curr_c[1]], v_val[curr_c[1]], curr_val[p[1]]),
                         ("^", v_val[curr_c[2]], v_val[curr_c[2]], curr_val[p[2]]),
                         ("^", v_val[curr_c[3]], v_val[curr_c[3]], curr_val[p[3]]),
                     ]})
+                    self.instrs.append({"valu": [
+                        ("^", v_val[curr_c[4]], v_val[curr_c[4]], curr_val[p[4]]),
+                        ("^", v_val[curr_c[5]], v_val[curr_c[5]], curr_val[p[5]]),
+                        ("^", v_val[curr_c[6]], v_val[curr_c[6]], curr_val[p[6]]),
+                        ("^", v_val[curr_c[7]], v_val[curr_c[7]], curr_val[p[7]]),
+                    ]})
 
-                    # Hash stages 0-5 overlapped with scattered loads for next group
+                    # Emit hash for 8 chunks (24 cycles) overlapped with 32 scattered loads
+                    # Hash has 6 stages, each with 4 cycles for 8 chunks
                     scatter_idx = 0
                     for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
-                        # Hash part 1 + loads
+                        # Cycle 1: op1+op3 for chunks 0-2 + 2 loads
                         instr = {"valu": [
                             (op1, v_tmp1[p[0]], v_val[curr_c[0]], v_c1), (op3, v_tmp2[p[0]], v_val[curr_c[0]], v_c3),
                             (op1, v_tmp1[p[1]], v_val[curr_c[1]], v_c1), (op3, v_tmp2[p[1]], v_val[curr_c[1]], v_c3),
-                        ]}
-                        if scatter_idx < 16:
-                            chunk = scatter_idx // 4
-                            pair = scatter_idx % 4
-                            instr["load"] = [
-                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
-                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)
-                            ]
-                            scatter_idx += 1
-                        self.instrs.append(instr)
-
-                        # Hash part 2 + loads
-                        instr = {"valu": [
                             (op1, v_tmp1[p[2]], v_val[curr_c[2]], v_c1), (op3, v_tmp2[p[2]], v_val[curr_c[2]], v_c3),
-                            (op1, v_tmp1[p[3]], v_val[curr_c[3]], v_c1), (op3, v_tmp2[p[3]], v_val[curr_c[3]], v_c3),
                         ]}
-                        if scatter_idx < 16:
+                        if scatter_idx < 32:
                             chunk = scatter_idx // 4
                             pair = scatter_idx % 4
                             instr["load"] = [
@@ -729,14 +822,49 @@ class KernelBuilder:
                             scatter_idx += 1
                         self.instrs.append(instr)
 
-                        # Hash part 3 + loads
+                        # Cycle 2: op1+op3 for chunks 3-5 + 2 loads
                         instr = {"valu": [
+                            (op1, v_tmp1[p[3]], v_val[curr_c[3]], v_c1), (op3, v_tmp2[p[3]], v_val[curr_c[3]], v_c3),
+                            (op1, v_tmp1[p[4]], v_val[curr_c[4]], v_c1), (op3, v_tmp2[p[4]], v_val[curr_c[4]], v_c3),
+                            (op1, v_tmp1[p[5]], v_val[curr_c[5]], v_c1), (op3, v_tmp2[p[5]], v_val[curr_c[5]], v_c3),
+                        ]}
+                        if scatter_idx < 32:
+                            chunk = scatter_idx // 4
+                            pair = scatter_idx % 4
+                            instr["load"] = [
+                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)
+                            ]
+                            scatter_idx += 1
+                        self.instrs.append(instr)
+
+                        # Cycle 3: op1+op3 for chunks 6-7, op2 for 0-1 + 2 loads
+                        instr = {"valu": [
+                            (op1, v_tmp1[p[6]], v_val[curr_c[6]], v_c1), (op3, v_tmp2[p[6]], v_val[curr_c[6]], v_c3),
+                            (op1, v_tmp1[p[7]], v_val[curr_c[7]], v_c1), (op3, v_tmp2[p[7]], v_val[curr_c[7]], v_c3),
                             (op2, v_val[curr_c[0]], v_tmp1[p[0]], v_tmp2[p[0]]),
                             (op2, v_val[curr_c[1]], v_tmp1[p[1]], v_tmp2[p[1]]),
+                        ]}
+                        if scatter_idx < 32:
+                            chunk = scatter_idx // 4
+                            pair = scatter_idx % 4
+                            instr["load"] = [
+                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)
+                            ]
+                            scatter_idx += 1
+                        self.instrs.append(instr)
+
+                        # Cycle 4: op2 for chunks 2-7 + 2 loads
+                        instr = {"valu": [
                             (op2, v_val[curr_c[2]], v_tmp1[p[2]], v_tmp2[p[2]]),
                             (op2, v_val[curr_c[3]], v_tmp1[p[3]], v_tmp2[p[3]]),
+                            (op2, v_val[curr_c[4]], v_tmp1[p[4]], v_tmp2[p[4]]),
+                            (op2, v_val[curr_c[5]], v_tmp1[p[5]], v_tmp2[p[5]]),
+                            (op2, v_val[curr_c[6]], v_tmp1[p[6]], v_tmp2[p[6]]),
+                            (op2, v_val[curr_c[7]], v_tmp1[p[7]], v_tmp2[p[7]]),
                         ]}
-                        if scatter_idx < 16:
+                        if scatter_idx < 32:
                             chunk = scatter_idx // 4
                             pair = scatter_idx % 4
                             instr["load"] = [
@@ -746,34 +874,114 @@ class KernelBuilder:
                             scatter_idx += 1
                         self.instrs.append(instr)
 
-                    # Index computation + remaining loads
-                    index_instrs = [
-                        {"valu": [("&", v_tmp1[p[0]], v_val[curr_c[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[curr_c[0]], v_one),
-                                  ("&", v_tmp1[p[1]], v_val[curr_c[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[curr_c[1]], v_one)]},
-                        {"valu": [("&", v_tmp1[p[2]], v_val[curr_c[2]], v_one), ("<<", v_tmp2[p[2]], v_idx[curr_c[2]], v_one),
-                                  ("&", v_tmp1[p[3]], v_val[curr_c[3]], v_one), ("<<", v_tmp2[p[3]], v_idx[curr_c[3]], v_one)]},
-                        {"valu": [("+", v_tmp1[p[0]], v_tmp1[p[0]], v_one), ("+", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
-                                  ("+", v_tmp1[p[2]], v_tmp1[p[2]], v_one), ("+", v_tmp1[p[3]], v_tmp1[p[3]], v_one)]},
-                        {"valu": [("+", v_idx[curr_c[0]], v_tmp2[p[0]], v_tmp1[p[0]]), ("+", v_idx[curr_c[1]], v_tmp2[p[1]], v_tmp1[p[1]]),
-                                  ("+", v_idx[curr_c[2]], v_tmp2[p[2]], v_tmp1[p[2]]), ("+", v_idx[curr_c[3]], v_tmp2[p[3]], v_tmp1[p[3]])]},
-                        {"valu": [("<", v_tmp1[p[0]], v_idx[curr_c[0]], v_n_nodes), ("<", v_tmp1[p[1]], v_idx[curr_c[1]], v_n_nodes),
-                                  ("<", v_tmp1[p[2]], v_idx[curr_c[2]], v_n_nodes), ("<", v_tmp1[p[3]], v_idx[curr_c[3]], v_n_nodes)]},
-                        {"valu": [("*", v_idx[curr_c[0]], v_idx[curr_c[0]], v_tmp1[p[0]]), ("*", v_idx[curr_c[1]], v_idx[curr_c[1]], v_tmp1[p[1]]),
-                                  ("*", v_idx[curr_c[2]], v_idx[curr_c[2]], v_tmp1[p[2]]), ("*", v_idx[curr_c[3]], v_idx[curr_c[3]], v_tmp1[p[3]])]},
-                    ]
-                    for instr in index_instrs:
-                        if scatter_idx < 16:
-                            chunk = scatter_idx // 4
-                            pair = scatter_idx % 4
-                            instr["load"] = [
-                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
-                                ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)
-                            ]
-                            scatter_idx += 1
-                        self.instrs.append(instr)
+                    # Index computation for 8 chunks (9 cycles) with remaining loads
+                    # bit = val & 1, shifted = idx << 1 for chunks 0-2
+                    instr = {"valu": [
+                        ("&", v_tmp1[p[0]], v_val[curr_c[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[curr_c[0]], v_one),
+                        ("&", v_tmp1[p[1]], v_val[curr_c[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[curr_c[1]], v_one),
+                        ("&", v_tmp1[p[2]], v_val[curr_c[2]], v_one), ("<<", v_tmp2[p[2]], v_idx[curr_c[2]], v_one),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
 
-                    # Any remaining loads
-                    while scatter_idx < 16:
+                    instr = {"valu": [
+                        ("&", v_tmp1[p[3]], v_val[curr_c[3]], v_one), ("<<", v_tmp2[p[3]], v_idx[curr_c[3]], v_one),
+                        ("&", v_tmp1[p[4]], v_val[curr_c[4]], v_one), ("<<", v_tmp2[p[4]], v_idx[curr_c[4]], v_one),
+                        ("&", v_tmp1[p[5]], v_val[curr_c[5]], v_one), ("<<", v_tmp2[p[5]], v_idx[curr_c[5]], v_one),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
+
+                    instr = {"valu": [
+                        ("&", v_tmp1[p[6]], v_val[curr_c[6]], v_one), ("<<", v_tmp2[p[6]], v_idx[curr_c[6]], v_one),
+                        ("&", v_tmp1[p[7]], v_val[curr_c[7]], v_one), ("<<", v_tmp2[p[7]], v_idx[curr_c[7]], v_one),
+                        ("+", v_tmp1[p[0]], v_tmp1[p[0]], v_one), ("+", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
+
+                    instr = {"valu": [
+                        ("+", v_tmp1[p[2]], v_tmp1[p[2]], v_one), ("+", v_tmp1[p[3]], v_tmp1[p[3]], v_one),
+                        ("+", v_tmp1[p[4]], v_tmp1[p[4]], v_one), ("+", v_tmp1[p[5]], v_tmp1[p[5]], v_one),
+                        ("+", v_tmp1[p[6]], v_tmp1[p[6]], v_one), ("+", v_tmp1[p[7]], v_tmp1[p[7]], v_one),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
+
+                    instr = {"valu": [
+                        ("+", v_idx[curr_c[0]], v_tmp2[p[0]], v_tmp1[p[0]]), ("+", v_idx[curr_c[1]], v_tmp2[p[1]], v_tmp1[p[1]]),
+                        ("+", v_idx[curr_c[2]], v_tmp2[p[2]], v_tmp1[p[2]]), ("+", v_idx[curr_c[3]], v_tmp2[p[3]], v_tmp1[p[3]]),
+                        ("+", v_idx[curr_c[4]], v_tmp2[p[4]], v_tmp1[p[4]]), ("+", v_idx[curr_c[5]], v_tmp2[p[5]], v_tmp1[p[5]]),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
+
+                    instr = {"valu": [
+                        ("+", v_idx[curr_c[6]], v_tmp2[p[6]], v_tmp1[p[6]]), ("+", v_idx[curr_c[7]], v_tmp2[p[7]], v_tmp1[p[7]]),
+                        ("<", v_tmp1[p[0]], v_idx[curr_c[0]], v_n_nodes), ("<", v_tmp1[p[1]], v_idx[curr_c[1]], v_n_nodes),
+                        ("<", v_tmp1[p[2]], v_idx[curr_c[2]], v_n_nodes), ("<", v_tmp1[p[3]], v_idx[curr_c[3]], v_n_nodes),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
+
+                    instr = {"valu": [
+                        ("<", v_tmp1[p[4]], v_idx[curr_c[4]], v_n_nodes), ("<", v_tmp1[p[5]], v_idx[curr_c[5]], v_n_nodes),
+                        ("<", v_tmp1[p[6]], v_idx[curr_c[6]], v_n_nodes), ("<", v_tmp1[p[7]], v_idx[curr_c[7]], v_n_nodes),
+                        ("*", v_idx[curr_c[0]], v_idx[curr_c[0]], v_tmp1[p[0]]), ("*", v_idx[curr_c[1]], v_idx[curr_c[1]], v_tmp1[p[1]]),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
+
+                    instr = {"valu": [
+                        ("*", v_idx[curr_c[2]], v_idx[curr_c[2]], v_tmp1[p[2]]), ("*", v_idx[curr_c[3]], v_idx[curr_c[3]], v_tmp1[p[3]]),
+                        ("*", v_idx[curr_c[4]], v_idx[curr_c[4]], v_tmp1[p[4]]), ("*", v_idx[curr_c[5]], v_idx[curr_c[5]], v_tmp1[p[5]]),
+                        ("*", v_idx[curr_c[6]], v_idx[curr_c[6]], v_tmp1[p[6]]), ("*", v_idx[curr_c[7]], v_idx[curr_c[7]], v_tmp1[p[7]]),
+                    ]}
+                    if scatter_idx < 32:
+                        chunk = scatter_idx // 4
+                        pair = scatter_idx % 4
+                        instr["load"] = [("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2),
+                                         ("load_offset", next_val[p[chunk]], next_addr[p[chunk]], pair*2+1)]
+                        scatter_idx += 1
+                    self.instrs.append(instr)
+
+                    # Emit remaining loads if any
+                    while scatter_idx < 32:
                         chunk = scatter_idx // 4
                         pair = scatter_idx % 4
                         self.instrs.append({"load": [
@@ -791,13 +999,20 @@ class KernelBuilder:
                 else:
                     last_val = v_node_val_B
 
+                # XOR for last group
                 self.instrs.append({"valu": [
                     ("^", v_val[last_c[0]], v_val[last_c[0]], last_val[p[0]]),
                     ("^", v_val[last_c[1]], v_val[last_c[1]], last_val[p[1]]),
                     ("^", v_val[last_c[2]], v_val[last_c[2]], last_val[p[2]]),
                     ("^", v_val[last_c[3]], v_val[last_c[3]], last_val[p[3]]),
+                    ("^", v_val[last_c[4]], v_val[last_c[4]], last_val[p[4]]),
+                    ("^", v_val[last_c[5]], v_val[last_c[5]], last_val[p[5]]),
                 ]})
-                emit_hash_and_index(last_c, p)
+                self.instrs.append({"valu": [
+                    ("^", v_val[last_c[6]], v_val[last_c[6]], last_val[p[6]]),
+                    ("^", v_val[last_c[7]], v_val[last_c[7]], last_val[p[7]]),
+                ]})
+                emit_hash_and_index_8(last_c, p)
 
         # ========== FINAL: Store all 32 chunks to memory ==========
         for chunk_i in range(0, n_chunks, 2):
