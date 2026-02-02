@@ -204,65 +204,161 @@ class KernelBuilder:
             self.instrs.append({"store": [("vstore", tmp_addr[p], v_idx[p]),
                                           ("vstore", tmp_addr2[p], v_val[p])]})
 
-        # ROUNDS 1+: Process 2 chunks at a time with good packing
+        # ROUNDS 1+: Process 4 chunks with interleaved pipeline
+        # Overlap: While chunks 0-1 do hash, chunks 2-3 do loads
         for round_i in range(1, rounds):
-            for base_chunk in range(0, n_chunks, 2):
-                pA, pB = 0, 1
-                offA = offset_consts[base_chunk]
-                offB = offset_consts[base_chunk + 1] if base_chunk + 1 < n_chunks else offA
+            chunk_i = 0
+            while chunk_i < n_chunks:
+                if chunk_i + 3 < n_chunks:
+                    # Process 4 chunks with pipelining
+                    p = [0, 1, 2, 3]
+                    off = [offset_consts[chunk_i + j] for j in range(4)]
 
-                # Address calc
-                self.instrs.append({"alu": [
-                    ("+", tmp_addr[pA], inp_idx_p, offA), ("+", tmp_addr2[pA], inp_val_p, offA),
-                    ("+", tmp_addr[pB], inp_idx_p, offB), ("+", tmp_addr2[pB], inp_val_p, offB),
-                ]})
-
-                # Load idx and val
-                self.instrs.append({"load": [("vload", v_idx[pA], tmp_addr[pA]), ("vload", v_val[pA], tmp_addr2[pA])]})
-                self.instrs.append({"load": [("vload", v_idx[pB], tmp_addr[pB]), ("vload", v_val[pB], tmp_addr2[pB])]})
-
-                # Node addr calc
-                self.instrs.append({"valu": [("+", v_node_addr[pA], v_idx[pA], v_forest_p),
-                                             ("+", v_node_addr[pB], v_idx[pB], v_forest_p)]})
-
-                # Scattered loads (8 cycles for both chunks)
-                for pair in range(4):
-                    self.instrs.append({"load": [("load_offset", v_node_val[pA], v_node_addr[pA], pair*2),
-                                                 ("load_offset", v_node_val[pA], v_node_addr[pA], pair*2+1)]})
-                for pair in range(4):
-                    self.instrs.append({"load": [("load_offset", v_node_val[pB], v_node_addr[pB], pair*2),
-                                                 ("load_offset", v_node_val[pB], v_node_addr[pB], pair*2+1)]})
-
-                # XOR + Hash
-                self.instrs.append({"valu": [("^", v_val[pA], v_val[pA], v_node_val[pA]),
-                                             ("^", v_val[pB], v_val[pB], v_node_val[pB])]})
-                for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
-                    self.instrs.append({"valu": [
-                        (op1, v_tmp1[pA], v_val[pA], v_c1), (op3, v_tmp2[pA], v_val[pA], v_c3),
-                        (op1, v_tmp1[pB], v_val[pB], v_c1), (op3, v_tmp2[pB], v_val[pB], v_c3),
+                    # Phase 1: Address calc for all 4 chunks (ALU has 12 slots)
+                    self.instrs.append({"alu": [
+                        ("+", tmp_addr[p[0]], inp_idx_p, off[0]), ("+", tmp_addr2[p[0]], inp_val_p, off[0]),
+                        ("+", tmp_addr[p[1]], inp_idx_p, off[1]), ("+", tmp_addr2[p[1]], inp_val_p, off[1]),
+                        ("+", tmp_addr[p[2]], inp_idx_p, off[2]), ("+", tmp_addr2[p[2]], inp_val_p, off[2]),
+                        ("+", tmp_addr[p[3]], inp_idx_p, off[3]), ("+", tmp_addr2[p[3]], inp_val_p, off[3]),
                     ]})
-                    self.instrs.append({"valu": [(op2, v_val[pA], v_tmp1[pA], v_tmp2[pA]),
-                                                 (op2, v_val[pB], v_tmp1[pB], v_tmp2[pB])]})
 
-                # Index computation
-                self.instrs.append({"valu": [
-                    ("&", v_tmp1[pA], v_val[pA], v_one), ("<<", v_tmp2[pA], v_idx[pA], v_one),
-                    ("&", v_tmp1[pB], v_val[pB], v_one), ("<<", v_tmp2[pB], v_idx[pB], v_one),
-                ]})
-                self.instrs.append({"valu": [("+", v_tmp1[pA], v_tmp1[pA], v_one),
-                                             ("+", v_tmp1[pB], v_tmp1[pB], v_one)]})
-                self.instrs.append({"valu": [("+", v_idx[pA], v_tmp2[pA], v_tmp1[pA]),
-                                             ("+", v_idx[pB], v_tmp2[pB], v_tmp1[pB])]})
-                self.instrs.append({"valu": [("<", v_tmp1[pA], v_idx[pA], v_n_nodes),
-                                             ("<", v_tmp1[pB], v_idx[pB], v_n_nodes)]})
-                self.instrs.append({"valu": [("*", v_idx[pA], v_idx[pA], v_tmp1[pA]),
-                                             ("*", v_idx[pB], v_idx[pB], v_tmp1[pB])]})
+                    # Phase 2: Load idx/val for chunks 0-1, then 2-3
+                    self.instrs.append({"load": [("vload", v_idx[p[0]], tmp_addr[p[0]]),
+                                                 ("vload", v_val[p[0]], tmp_addr2[p[0]])]})
+                    self.instrs.append({"load": [("vload", v_idx[p[1]], tmp_addr[p[1]]),
+                                                 ("vload", v_val[p[1]], tmp_addr2[p[1]])]})
+                    self.instrs.append({"load": [("vload", v_idx[p[2]], tmp_addr[p[2]]),
+                                                 ("vload", v_val[p[2]], tmp_addr2[p[2]])]})
+                    self.instrs.append({"load": [("vload", v_idx[p[3]], tmp_addr[p[3]]),
+                                                 ("vload", v_val[p[3]], tmp_addr2[p[3]])]})
 
-                # Store
-                self.instrs.append({"alu": [("+", tmp_addr[pA], inp_idx_p, offA), ("+", tmp_addr2[pA], inp_val_p, offA),
-                                            ("+", tmp_addr[pB], inp_idx_p, offB), ("+", tmp_addr2[pB], inp_val_p, offB)]})
-                self.instrs.append({"store": [("vstore", tmp_addr[pA], v_idx[pA]), ("vstore", tmp_addr2[pA], v_val[pA])]})
-                self.instrs.append({"store": [("vstore", tmp_addr[pB], v_idx[pB]), ("vstore", tmp_addr2[pB], v_val[pB])]})
+                    # Phase 3: Node addr calc for all 4 (fits in 6 VALU slots)
+                    self.instrs.append({"valu": [
+                        ("+", v_node_addr[p[0]], v_idx[p[0]], v_forest_p),
+                        ("+", v_node_addr[p[1]], v_idx[p[1]], v_forest_p),
+                        ("+", v_node_addr[p[2]], v_idx[p[2]], v_forest_p),
+                        ("+", v_node_addr[p[3]], v_idx[p[3]], v_forest_p),
+                    ]})
+
+                    # Phase 4: Scattered loads for all 4 chunks (16 cycles total)
+                    for pair in range(4):
+                        self.instrs.append({"load": [("load_offset", v_node_val[p[0]], v_node_addr[p[0]], pair*2),
+                                                     ("load_offset", v_node_val[p[0]], v_node_addr[p[0]], pair*2+1)]})
+                    for pair in range(4):
+                        self.instrs.append({"load": [("load_offset", v_node_val[p[1]], v_node_addr[p[1]], pair*2),
+                                                     ("load_offset", v_node_val[p[1]], v_node_addr[p[1]], pair*2+1)]})
+                    for pair in range(4):
+                        self.instrs.append({"load": [("load_offset", v_node_val[p[2]], v_node_addr[p[2]], pair*2),
+                                                     ("load_offset", v_node_val[p[2]], v_node_addr[p[2]], pair*2+1)]})
+                    for pair in range(4):
+                        self.instrs.append({"load": [("load_offset", v_node_val[p[3]], v_node_addr[p[3]], pair*2),
+                                                     ("load_offset", v_node_val[p[3]], v_node_addr[p[3]], pair*2+1)]})
+
+                    # Phase 5: XOR + Hash for all 4 chunks (use 4 VALU slots per hash stage)
+                    self.instrs.append({"valu": [
+                        ("^", v_val[p[0]], v_val[p[0]], v_node_val[p[0]]),
+                        ("^", v_val[p[1]], v_val[p[1]], v_node_val[p[1]]),
+                        ("^", v_val[p[2]], v_val[p[2]], v_node_val[p[2]]),
+                        ("^", v_val[p[3]], v_val[p[3]], v_node_val[p[3]]),
+                    ]})
+                    for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
+                        # Part 1 for chunks 0-1
+                        self.instrs.append({"valu": [
+                            (op1, v_tmp1[p[0]], v_val[p[0]], v_c1), (op3, v_tmp2[p[0]], v_val[p[0]], v_c3),
+                            (op1, v_tmp1[p[1]], v_val[p[1]], v_c1), (op3, v_tmp2[p[1]], v_val[p[1]], v_c3),
+                        ]})
+                        # Part 1 for chunks 2-3
+                        self.instrs.append({"valu": [
+                            (op1, v_tmp1[p[2]], v_val[p[2]], v_c1), (op3, v_tmp2[p[2]], v_val[p[2]], v_c3),
+                            (op1, v_tmp1[p[3]], v_val[p[3]], v_c1), (op3, v_tmp2[p[3]], v_val[p[3]], v_c3),
+                        ]})
+                        # Part 2 for all 4
+                        self.instrs.append({"valu": [
+                            (op2, v_val[p[0]], v_tmp1[p[0]], v_tmp2[p[0]]),
+                            (op2, v_val[p[1]], v_tmp1[p[1]], v_tmp2[p[1]]),
+                            (op2, v_val[p[2]], v_tmp1[p[2]], v_tmp2[p[2]]),
+                            (op2, v_val[p[3]], v_tmp1[p[3]], v_tmp2[p[3]]),
+                        ]})
+
+                    # Phase 6: Index computation for all 4
+                    self.instrs.append({"valu": [
+                        ("&", v_tmp1[p[0]], v_val[p[0]], v_one), ("<<", v_tmp2[p[0]], v_idx[p[0]], v_one),
+                        ("&", v_tmp1[p[1]], v_val[p[1]], v_one), ("<<", v_tmp2[p[1]], v_idx[p[1]], v_one),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("&", v_tmp1[p[2]], v_val[p[2]], v_one), ("<<", v_tmp2[p[2]], v_idx[p[2]], v_one),
+                        ("&", v_tmp1[p[3]], v_val[p[3]], v_one), ("<<", v_tmp2[p[3]], v_idx[p[3]], v_one),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("+", v_tmp1[p[0]], v_tmp1[p[0]], v_one), ("+", v_tmp1[p[1]], v_tmp1[p[1]], v_one),
+                        ("+", v_tmp1[p[2]], v_tmp1[p[2]], v_one), ("+", v_tmp1[p[3]], v_tmp1[p[3]], v_one),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("+", v_idx[p[0]], v_tmp2[p[0]], v_tmp1[p[0]]), ("+", v_idx[p[1]], v_tmp2[p[1]], v_tmp1[p[1]]),
+                        ("+", v_idx[p[2]], v_tmp2[p[2]], v_tmp1[p[2]]), ("+", v_idx[p[3]], v_tmp2[p[3]], v_tmp1[p[3]]),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("<", v_tmp1[p[0]], v_idx[p[0]], v_n_nodes), ("<", v_tmp1[p[1]], v_idx[p[1]], v_n_nodes),
+                        ("<", v_tmp1[p[2]], v_idx[p[2]], v_n_nodes), ("<", v_tmp1[p[3]], v_idx[p[3]], v_n_nodes),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("*", v_idx[p[0]], v_idx[p[0]], v_tmp1[p[0]]), ("*", v_idx[p[1]], v_idx[p[1]], v_tmp1[p[1]]),
+                        ("*", v_idx[p[2]], v_idx[p[2]], v_tmp1[p[2]]), ("*", v_idx[p[3]], v_idx[p[3]], v_tmp1[p[3]]),
+                    ]})
+
+                    # Phase 7: Store all 4 chunks
+                    self.instrs.append({"alu": [
+                        ("+", tmp_addr[p[0]], inp_idx_p, off[0]), ("+", tmp_addr2[p[0]], inp_val_p, off[0]),
+                        ("+", tmp_addr[p[1]], inp_idx_p, off[1]), ("+", tmp_addr2[p[1]], inp_val_p, off[1]),
+                        ("+", tmp_addr[p[2]], inp_idx_p, off[2]), ("+", tmp_addr2[p[2]], inp_val_p, off[2]),
+                        ("+", tmp_addr[p[3]], inp_idx_p, off[3]), ("+", tmp_addr2[p[3]], inp_val_p, off[3]),
+                    ]})
+                    self.instrs.append({"store": [("vstore", tmp_addr[p[0]], v_idx[p[0]]),
+                                                  ("vstore", tmp_addr2[p[0]], v_val[p[0]])]})
+                    self.instrs.append({"store": [("vstore", tmp_addr[p[1]], v_idx[p[1]]),
+                                                  ("vstore", tmp_addr2[p[1]], v_val[p[1]])]})
+                    self.instrs.append({"store": [("vstore", tmp_addr[p[2]], v_idx[p[2]]),
+                                                  ("vstore", tmp_addr2[p[2]], v_val[p[2]])]})
+                    self.instrs.append({"store": [("vstore", tmp_addr[p[3]], v_idx[p[3]]),
+                                                  ("vstore", tmp_addr2[p[3]], v_val[p[3]])]})
+
+                    chunk_i += 4
+                else:
+                    # Process remaining chunks normally (2 at a time)
+                    pA, pB = 0, 1
+                    offA = offset_consts[chunk_i]
+                    offB = offset_consts[min(chunk_i + 1, n_chunks - 1)]
+
+                    self.instrs.append({"alu": [("+", tmp_addr[pA], inp_idx_p, offA), ("+", tmp_addr2[pA], inp_val_p, offA),
+                                                ("+", tmp_addr[pB], inp_idx_p, offB), ("+", tmp_addr2[pB], inp_val_p, offB)]})
+                    self.instrs.append({"load": [("vload", v_idx[pA], tmp_addr[pA]), ("vload", v_val[pA], tmp_addr2[pA])]})
+                    self.instrs.append({"load": [("vload", v_idx[pB], tmp_addr[pB]), ("vload", v_val[pB], tmp_addr2[pB])]})
+                    self.instrs.append({"valu": [("+", v_node_addr[pA], v_idx[pA], v_forest_p),
+                                                 ("+", v_node_addr[pB], v_idx[pB], v_forest_p)]})
+                    for pair in range(4):
+                        self.instrs.append({"load": [("load_offset", v_node_val[pA], v_node_addr[pA], pair*2),
+                                                     ("load_offset", v_node_val[pA], v_node_addr[pA], pair*2+1)]})
+                    for pair in range(4):
+                        self.instrs.append({"load": [("load_offset", v_node_val[pB], v_node_addr[pB], pair*2),
+                                                     ("load_offset", v_node_val[pB], v_node_addr[pB], pair*2+1)]})
+                    self.instrs.append({"valu": [("^", v_val[pA], v_val[pA], v_node_val[pA]),
+                                                 ("^", v_val[pB], v_val[pB], v_node_val[pB])]})
+                    for v_c1, v_c3, op1, op2, op3 in v_hash_consts:
+                        self.instrs.append({"valu": [(op1, v_tmp1[pA], v_val[pA], v_c1), (op3, v_tmp2[pA], v_val[pA], v_c3),
+                                                     (op1, v_tmp1[pB], v_val[pB], v_c1), (op3, v_tmp2[pB], v_val[pB], v_c3)]})
+                        self.instrs.append({"valu": [(op2, v_val[pA], v_tmp1[pA], v_tmp2[pA]),
+                                                     (op2, v_val[pB], v_tmp1[pB], v_tmp2[pB])]})
+                    self.instrs.append({"valu": [("&", v_tmp1[pA], v_val[pA], v_one), ("<<", v_tmp2[pA], v_idx[pA], v_one),
+                                                 ("&", v_tmp1[pB], v_val[pB], v_one), ("<<", v_tmp2[pB], v_idx[pB], v_one)]})
+                    self.instrs.append({"valu": [("+", v_tmp1[pA], v_tmp1[pA], v_one), ("+", v_tmp1[pB], v_tmp1[pB], v_one)]})
+                    self.instrs.append({"valu": [("+", v_idx[pA], v_tmp2[pA], v_tmp1[pA]), ("+", v_idx[pB], v_tmp2[pB], v_tmp1[pB])]})
+                    self.instrs.append({"valu": [("<", v_tmp1[pA], v_idx[pA], v_n_nodes), ("<", v_tmp1[pB], v_idx[pB], v_n_nodes)]})
+                    self.instrs.append({"valu": [("*", v_idx[pA], v_idx[pA], v_tmp1[pA]), ("*", v_idx[pB], v_idx[pB], v_tmp1[pB])]})
+                    self.instrs.append({"alu": [("+", tmp_addr[pA], inp_idx_p, offA), ("+", tmp_addr2[pA], inp_val_p, offA),
+                                                ("+", tmp_addr[pB], inp_idx_p, offB), ("+", tmp_addr2[pB], inp_val_p, offB)]})
+                    self.instrs.append({"store": [("vstore", tmp_addr[pA], v_idx[pA]), ("vstore", tmp_addr2[pA], v_val[pA])]})
+                    self.instrs.append({"store": [("vstore", tmp_addr[pB], v_idx[pB]), ("vstore", tmp_addr2[pB], v_val[pB])]})
+                    chunk_i += 2
 
         self.instrs.append({"flow": [("pause",)]})
 
