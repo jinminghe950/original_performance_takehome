@@ -306,24 +306,22 @@ class KernelBuilder:
         ALU lane offload) to hide the flow engine's serial latency.
         """
         base = 2 ** d - 1
-        one_v = self.bcast(1)
         basev = self.bcast(base)
-        # Bit extraction goes on the ALU (per lane) when AUX_ALU is set, keeping
-        # the whole mux off the valu engine (only flow + alu pay).
+        # Select bits are extracted as independent masks (p & 1, p & 2, p & 4):
+        # vselect only tests for nonzero, so no shifts are needed.  This drops an
+        # op and removes the serial shift chain, improving ILP.  On AUX_ALU the
+        # masking runs per-lane on the ALU to keep the whole mux off valu.
         if getattr(self, "AUX_ALU", False):
-            ext = lambda op, dst, a: self.aluv(op, dst, a, one_v)
+            mask = lambda dst, a, m: self.aluv("&", dst, a, m)
             p = self.vtemp(); self.aluv("-", p, idx_v, basev)
         else:
-            ext = lambda op, dst, a: self.vbin(op, dst, a, one_v)
+            mask = lambda dst, a, m: self.vbin("&", dst, a, m)
             p = self.vtemp(); self.vbin("-", p, idx_v, basev)
         bits = []
-        pp = p
         for i in range(d):
-            if i == d - 1:
-                bits.append(pp)
-            else:
-                bt = self.vtemp(); ext("&", bt, pp); bits.append(bt)
-                np = self.vtemp(); ext(">>", np, pp); pp = np
+            bt = self.vtemp()
+            mask(bt, p, self.bcast(1 << i))
+            bits.append(bt)
         level = [self.fbcast[base + k] for k in range(2 ** d)]
         for i in range(d):
             nxt = []
@@ -522,6 +520,8 @@ class KernelBuilder:
         self.hsh = [self.bcast(19), self.bcast(9), self.bcast(16)]
         for d in self.mux_depths:
             self.bcast(2 ** d - 1)
+            for i in range(d):  # mux select-bit masks (1, 2, 4, ...)
+                self.bcast(1 << i)
 
         # forest values to preload (depth-0 node + every mux-depth block)
         need_nodes = set()
