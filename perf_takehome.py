@@ -117,6 +117,16 @@ class KernelBuilder:
     def vbin(self, op, dest, a, b):
         self.emit("valu", (op, dest, a, b), self.rng(a) + self.rng(b), self.rng(dest))
 
+    def aluv(self, op, dest, a, bscalar):
+        """Apply a scalar ALU op across all VLEN lanes (b is a scalar source).
+
+        Used to push cheap per-lane bookkeeping (bit extraction, gather address
+        arithmetic, mux select bits) onto the otherwise-spare ALU engine so the
+        valu engine carries only the hash, leaving it the sole ~1184-cycle pole.
+        """
+        for j in range(VLEN):
+            self.emit("alu", (op, dest + j, a + j, bscalar), [a + j, bscalar], [dest + j])
+
     def vmadd(self, dest, a, b, c):
         self.emit(
             "valu",
@@ -297,16 +307,23 @@ class KernelBuilder:
         """
         base = 2 ** d - 1
         one_v = self.bcast(1)
-        p = self.vtemp()
-        self.vbin("-", p, idx_v, self.bcast(base))
+        basev = self.bcast(base)
+        # Bit extraction goes on the ALU (per lane) when AUX_ALU is set, keeping
+        # the whole mux off the valu engine (only flow + alu pay).
+        if getattr(self, "AUX_ALU", False):
+            ext = lambda op, dst, a: self.aluv(op, dst, a, one_v)
+            p = self.vtemp(); self.aluv("-", p, idx_v, basev)
+        else:
+            ext = lambda op, dst, a: self.vbin(op, dst, a, one_v)
+            p = self.vtemp(); self.vbin("-", p, idx_v, basev)
         bits = []
         pp = p
         for i in range(d):
             if i == d - 1:
                 bits.append(pp)
             else:
-                bt = self.vtemp(); self.vbin("&", bt, pp, one_v); bits.append(bt)
-                np = self.vtemp(); self.vbin(">>", np, pp, one_v); pp = np
+                bt = self.vtemp(); ext("&", bt, pp); bits.append(bt)
+                np = self.vtemp(); ext(">>", np, pp); pp = np
         level = [self.fbcast[base + k] for k in range(2 ** d)]
         for i in range(d):
             nxt = []
@@ -343,9 +360,13 @@ class KernelBuilder:
             if getattr(self, "MUX_MODE", "flow") == "flow":
                 return self.flow_mux(d, idx_v)
             return self.arith_mux(d, idx_v)
-        # gather: addr = forest_values_p + idx, then scalar loads per lane
+        # gather: addr = forest_values_p + idx, then scalar loads per lane.
+        # Address arithmetic goes on the ALU when AUX_ALU so valu stays hash-only.
         addr = self.vtemp()
-        self.vbin("+", addr, idx_v, self.seven_v)
+        if getattr(self, "AUX_ALU", False):
+            self.aluv("+", addr, idx_v, self.seven_v)
+        else:
+            self.vbin("+", addr, idx_v, self.seven_v)
         node = self.vtemp()
         for j in range(VLEN):
             self.emit("load", ("load", node + j, addr + j), [addr + j], [node + j])
@@ -621,22 +642,34 @@ class KernelBuilder:
                 # last round: idx unused.  leaf: next round is depth 0 which
                 # recomputes idx from scratch.
                 return
-            # idx = 2*idx + 1 + (val & 1).  The +1/+2 increment select can run
-            # on the (often idle) flow engine to take load off valu.
-            bit = self.vtemp()
-            self.vbin("&", bit, val[v], one_v)
-            if getattr(self, "IDX_INC_FLOW", True):
-                inc = idx[v] if d == 0 else self.vtemp()
-                self.emit("flow", ("vselect", inc, bit, two_v, one_v),
-                          self.rng(bit) + self.rng(two_v) + self.rng(one_v), self.rng(inc))
-                if d != 0:
+            # idx = 2*idx + 1 + (val & 1).  In AUX_ALU mode the parity bit and
+            # the (1+bit) increment are both computed on the ALU, leaving valu
+            # to pay only the doubling multiply_add -- so the whole index update
+            # costs valu a single op while flow stays free for the mux.
+            if getattr(self, "AUX_ALU", False):
+                bit = self.vtemp()
+                self.aluv("&", bit, val[v], one_v)
+                if d == 0:
+                    self.aluv("+", idx[v], bit, one_v)       # idx = 1 + bit
+                else:
+                    inc = self.vtemp()
+                    self.aluv("+", inc, bit, one_v)
                     self.vmadd(idx[v], idx[v], two_v, inc)
-            elif d == 0:
-                self.vbin("+", idx[v], bit, one_v)
             else:
-                inc = self.vtemp()
-                self.vbin("+", inc, bit, one_v)
-                self.vmadd(idx[v], idx[v], two_v, inc)
+                bit = self.vtemp()
+                self.vbin("&", bit, val[v], one_v)
+                if getattr(self, "IDX_INC_FLOW", True):
+                    inc = idx[v] if d == 0 else self.vtemp()
+                    self.emit("flow", ("vselect", inc, bit, two_v, one_v),
+                              self.rng(bit) + self.rng(two_v) + self.rng(one_v), self.rng(inc))
+                    if d != 0:
+                        self.vmadd(idx[v], idx[v], two_v, inc)
+                elif d == 0:
+                    self.vbin("+", idx[v], bit, one_v)
+                else:
+                    inc = self.vtemp()
+                    self.vbin("+", inc, bit, one_v)
+                    self.vmadd(idx[v], idx[v], two_v, inc)
 
         # Diagonal wavefront emission: chunk c is offset c*STAG rounds, so at a
         # given wavefront different chunks occupy different rounds.  This keeps
@@ -656,12 +689,13 @@ class KernelBuilder:
         # reached round STAG, so chunks occupy different rounds at once and one
         # chunk's gather loads overlap another chunk's hash compute.  The dummy
         # scratch words carry no real data -- they only constrain the schedule.
-        for c in range(1, NC):
-            dummy = self.dummies[c - 1]
-            wop = first_op[(STAG, chunks[c - 1][0])]
-            self.ops[wop][3].append(dummy)
-            for v in chunks[c]:
-                self.ops[first_op[(0, v)]][2].append(dummy)
+        if not getattr(self, "NO_GATES", False):
+            for c in range(1, NC):
+                dummy = self.dummies[c - 1]
+                wop = first_op[(STAG, chunks[c - 1][0])]
+                self.ops[wop][3].append(dummy)
+                for v in chunks[c]:
+                    self.ops[first_op[(0, v)]][2].append(dummy)
 
         # ---- store final values (addresses already in init_addr) ----
         for v in range(nvec):
