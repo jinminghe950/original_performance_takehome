@@ -384,24 +384,27 @@ class KernelBuilder:
 
         n = len(ops)
         preds = [0] * n
-        succs = [[] for _ in range(n)]
+        succs = [[] for _ in range(n)]  # list of (succ, delay)
         last_writer = {}
         last_readers = defaultdict(list)
         for i, (engine, slot, reads, writes) in enumerate(ops):
-            ps = set()
+            # delay 1 == must be in a strictly later bundle (RAW/WAW);
+            # delay 0 == may share the bundle (WAR: reads happen before writes).
+            deps = {}
             for a in reads:
                 w = last_writer.get(a)
                 if w is not None:
-                    ps.add(w)
+                    deps[w] = 1
             for a in writes:
                 w = last_writer.get(a)
                 if w is not None:
-                    ps.add(w)
+                    deps[w] = 1
                 for r in last_readers.get(a, ()):
-                    ps.add(r)
-            preds[i] = len(ps)
-            for p in ps:
-                succs[p].append(i)
+                    if r not in deps:
+                        deps[r] = 0
+            preds[i] = len(deps)
+            for p, dl in deps.items():
+                succs[p].append((i, dl))
             for a in writes:
                 last_writer[a] = i
                 last_readers[a] = []
@@ -412,7 +415,7 @@ class KernelBuilder:
         cp = [1] * n
         for i in range(n - 1, -1, -1):
             best = 0
-            for s in succs[i]:
+            for s, _dl in succs[i]:
                 if cp[s] > best:
                     best = cp[s]
             cp[i] = best + 1
@@ -442,23 +445,33 @@ class KernelBuilder:
             cnt = {}
             cur = {}
             leftover = []
-            while avail:
-                k = heapq.heappop(avail)
-                i = k[2]
-                engine = ops[i][0]
-                if cnt.get(engine, 0) < SLOT_LIMITS[engine]:
-                    cnt[engine] = cnt.get(engine, 0) + 1
-                    bundle[i] = b
-                    scheduled += 1
-                    cur.setdefault(engine, []).append(ops[i][1])
-                    for s in succs[i]:
-                        indeg[s] -= 1
-                        if b + 1 > earliest[s]:
-                            earliest[s] = b + 1
-                        if indeg[s] == 0:
-                            heapq.heappush(waiting, (earliest[s], key[s]))
-                else:
-                    leftover.append(k)
+            # Fill bundle b, re-scanning so WAR-relaxed (delay-0) successors that
+            # become ready can also land in this same bundle when slots remain.
+            while True:
+                progress = False
+                while avail:
+                    k = heapq.heappop(avail)
+                    i = k[2]
+                    engine = ops[i][0]
+                    if cnt.get(engine, 0) < SLOT_LIMITS[engine]:
+                        cnt[engine] = cnt.get(engine, 0) + 1
+                        bundle[i] = b
+                        scheduled += 1
+                        progress = True
+                        cur.setdefault(engine, []).append(ops[i][1])
+                        for s, dl in succs[i]:
+                            indeg[s] -= 1
+                            if b + dl > earliest[s]:
+                                earliest[s] = b + dl
+                            if indeg[s] == 0:
+                                heapq.heappush(waiting, (earliest[s], key[s]))
+                    else:
+                        leftover.append(k)
+                while waiting and waiting[0][0] <= b:
+                    _, k = heapq.heappop(waiting)
+                    heapq.heappush(avail, k)
+                if not avail or not progress:
+                    break
             bundles.append(cur)
             for x in leftover:
                 heapq.heappush(avail, x)
