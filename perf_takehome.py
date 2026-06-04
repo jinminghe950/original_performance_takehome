@@ -218,7 +218,10 @@ class KernelBuilder:
             aw = val_v + j
             if d == 0:
                 node = sc["f0"]
-            elif self.mux_here(r, d):
+            elif self.mux_here(r, d) and d <= getattr(self, "ALU_MUX_MAX", 2):
+                # ALU lanes scalar-mux only shallow depths; deeper muxed depths
+                # are gathered here (cheap, only these few lanes) to avoid the
+                # heavy scalar mux tree -- keeps the ALU engine balanced.
                 node = self.s_mux(d, idx_v + j)
             else:
                 addr = self.stemp()
@@ -469,8 +472,8 @@ class KernelBuilder:
         # Depths in mux_always are routed via mux tree on every pass; depths in
         # mux_late are muxed only on the second pass (where the load engine is
         # idle), so the first pass keeps a tight load-bound gather streak.
-        MUX_MAX = getattr(self, "MUX_MAX", 2)
-        MUX_LATE_MAX = getattr(self, "MUX_LATE_MAX", 2)
+        MUX_MAX = getattr(self, "MUX_MAX", 3)
+        MUX_LATE_MAX = getattr(self, "MUX_LATE_MAX", 3)
         self.mux_always = set(
             d for d in range(1, MUX_MAX + 1) if d in used_depths and 2 ** d <= n_nodes
         )
@@ -523,11 +526,11 @@ class KernelBuilder:
         }
 
         # dummy scratch words used only to inject pipeline-stagger dependencies
-        self.dummies = [self.alloc_scratch(None) for _ in range(max(0, getattr(self, "NC", 7) - 1))]
+        self.dummies = [self.alloc_scratch(None) for _ in range(max(0, getattr(self, "NC", 8) - 1))]
 
         self.val = val
         self.idx = idx
-        n_alu = getattr(self, "ALU_VECS", 4)
+        n_alu = getattr(self, "ALU_VECS", 5)
 
         # scalar-engine constant sources (lane 0 of each broadcast holds the
         # scalar value) plus a scalar temp pool for the ALU lane path.
@@ -586,9 +589,13 @@ class KernelBuilder:
 
         # ---- main loop (chunk-major so pipeline-stagger gates precede the
         #      ops they delay in program order) ----
-        alu_set = set(range(nvec - n_alu, nvec))
-        NC = getattr(self, "NC", 7)
-        STAG = getattr(self, "STAG", 2)
+        # Spread the ALU-processed vectors evenly across the index range so
+        # that every pipeline chunk contains a similar mix of valu and alu
+        # lanes -- otherwise the (slow, bursty) ALU work clumps into a few
+        # chunks and starves the other engine there.
+        alu_set = set((i * nvec) // n_alu for i in range(n_alu)) if n_alu else set()
+        NC = getattr(self, "NC", 8)
+        STAG = getattr(self, "STAG", 3)
         if NC > 1 and nvec >= NC:
             cs = nvec // NC
             chunks = [
@@ -614,10 +621,17 @@ class KernelBuilder:
                 # last round: idx unused.  leaf: next round is depth 0 which
                 # recomputes idx from scratch.
                 return
-            # idx = 2*idx + 1 + (val & 1), all arithmetic (no flow).
+            # idx = 2*idx + 1 + (val & 1).  The +1/+2 increment select can run
+            # on the (often idle) flow engine to take load off valu.
             bit = self.vtemp()
             self.vbin("&", bit, val[v], one_v)
-            if d == 0:
+            if getattr(self, "IDX_INC_FLOW", True):
+                inc = idx[v] if d == 0 else self.vtemp()
+                self.emit("flow", ("vselect", inc, bit, two_v, one_v),
+                          self.rng(bit) + self.rng(two_v) + self.rng(one_v), self.rng(inc))
+                if d != 0:
+                    self.vmadd(idx[v], idx[v], two_v, inc)
+            elif d == 0:
                 self.vbin("+", idx[v], bit, one_v)
             else:
                 inc = self.vtemp()
