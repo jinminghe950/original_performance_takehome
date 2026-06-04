@@ -211,14 +211,14 @@ class KernelBuilder:
             level = nxt
         return level[0]
 
-    def s_process(self, v, d, last, is_leaf):
+    def s_process(self, v, d, last, is_leaf, r):
         sc = self.sc
         val_v, idx_v = self.val[v], self.idx[v]
         for j in range(VLEN):
             aw = val_v + j
             if d == 0:
                 node = sc["f0"]
-            elif d in self.mux_depths:
+            elif self.mux_here(r, d):
                 node = self.s_mux(d, idx_v + j)
             else:
                 addr = self.stemp()
@@ -319,11 +319,24 @@ class KernelBuilder:
             level = nxt
         return level[0]
 
-    def get_node(self, d, idx_v):
+    def mux_here(self, r, d):
+        """Whether to route depth d via mux (vs gather) at round r.
+
+        Depths in mux_always are muxed everywhere; depths in mux_late are muxed
+        only on the second (and later) pass, where the load engine is otherwise
+        idle, so the first pass keeps a tight load-bound gather streak.
+        """
+        if d in self.mux_always:
+            return True
+        if d in self.mux_late and r > self.H:
+            return True
+        return False
+
+    def get_node(self, d, idx_v, r):
         """Vector of node values forest[idx] for this round's depth d."""
         if d == 0:
             return self.fbcast[0]
-        if d in self.mux_depths:
+        if self.mux_here(r, d):
             if getattr(self, "MUX_MODE", "flow") == "flow":
                 return self.flow_mux(d, idx_v)
             return self.arith_mux(d, idx_v)
@@ -447,14 +460,25 @@ class KernelBuilder:
         self._bcache = {}
         self._bpending = []
 
+        self.H = H
         depth_of = lambda r: r % (H + 1)
         used_depths = set(depth_of(r) for r in range(rounds))
+        # depths that recur on the second (and later) pass over the tree
+        late_depths = set(depth_of(r) for r in range(H + 1, rounds))
 
-        # Which shallow depths to route via mux tree instead of gathering.
+        # Depths in mux_always are routed via mux tree on every pass; depths in
+        # mux_late are muxed only on the second pass (where the load engine is
+        # idle), so the first pass keeps a tight load-bound gather streak.
         MUX_MAX = getattr(self, "MUX_MAX", 2)
-        self.mux_depths = set(
+        MUX_LATE_MAX = getattr(self, "MUX_LATE_MAX", 2)
+        self.mux_always = set(
             d for d in range(1, MUX_MAX + 1) if d in used_depths and 2 ** d <= n_nodes
         )
+        self.mux_late = set(
+            d for d in range(MUX_MAX + 1, MUX_LATE_MAX + 1)
+            if d in late_depths and 2 ** d <= n_nodes
+        )
+        self.mux_depths = self.mux_always | self.mux_late
 
         # ---- allocate persistent state ----
         val = [self.alloc_scratch(f"val{v}", VLEN) for v in range(nvec)]
@@ -498,9 +522,12 @@ class KernelBuilder:
             for d in self.mux_depths
         }
 
+        # dummy scratch words used only to inject pipeline-stagger dependencies
+        self.dummies = [self.alloc_scratch(None) for _ in range(max(0, getattr(self, "NC", 7) - 1))]
+
         self.val = val
         self.idx = idx
-        n_alu = getattr(self, "ALU_VECS", 7)
+        n_alu = getattr(self, "ALU_VECS", 4)
 
         # scalar-engine constant sources (lane 0 of each broadcast holds the
         # scalar value) plus a scalar temp pool for the ALU lane path.
@@ -526,11 +553,19 @@ class KernelBuilder:
             self.emit("load", ("const", s, v), [], [s])
             self.emit("valu", ("vbroadcast", vb, s), [s], self.rng(vb))
 
+        # base pointers (a single const each); addresses are derived from these
+        # on the idle flow engine (add_imm) to keep const ops off the
+        # load-engine critical resource.
+        ivp_base = self.alloc_scratch(None)
+        fp_base = self.alloc_scratch(None)
+        self.emit("load", ("const", ivp_base, IVP), [], [ivp_base])
+        self.emit("load", ("const", fp_base, FP), [], [fp_base])
+
         # ---- preload forest constants ----
         for nidx in sorted(need_nodes):
             a = fnode_a[nidx]
             s = fnode_s[nidx]
-            self.emit("load", ("const", a, FP + nidx), [], [a])
+            self.emit("flow", ("add_imm", a, fp_base, nidx), [fp_base], [a])
             self.emit("load", ("load", s, a), [a], [s])
             self.emit("valu", ("vbroadcast", self.fbcast[nidx], s), [s], self.rng(self.fbcast[nidx]))
 
@@ -542,53 +577,82 @@ class KernelBuilder:
                 hi, lo = self.fbcast[base + k + 1], self.fbcast[base + k]
                 self.emit("valu", ("-", dv, hi, lo), self.rng(hi) + self.rng(lo), self.rng(dv))
 
-        # ---- load initial values ----
+        # ---- load initial values (addresses via flow add_imm, reused for the
+        #      final stores) ----
         for v in range(nvec):
             a = init_addr[v]
-            self.emit("load", ("const", a, IVP + v * VLEN), [], [a])
+            self.emit("flow", ("add_imm", a, ivp_base, v * VLEN), [ivp_base], [a])
             self.emit("load", ("vload", val[v], a), [a], self.rng(val[v]))
 
-        # ---- main loop ----
+        # ---- main loop (chunk-major so pipeline-stagger gates precede the
+        #      ops they delay in program order) ----
         alu_set = set(range(nvec - n_alu, nvec))
-        for r in range(rounds):
+        NC = getattr(self, "NC", 7)
+        STAG = getattr(self, "STAG", 2)
+        if NC > 1 and nvec >= NC:
+            cs = nvec // NC
+            chunks = [
+                list(range(c * cs, nvec if c == NC - 1 else (c + 1) * cs))
+                for c in range(NC)
+            ]
+        else:
+            NC = 1
+            chunks = [list(range(nvec))]
+
+        def process(v, r):
             d = depth_of(r)
             last = r == rounds - 1
             is_leaf = (d == H) and not last
-            for v in range(nvec):
-                # Diagonal wavefront priority: group g (= v//gs) is staggered
-                # one round behind group g-1, so at any moment different vector
-                # groups occupy different rounds -- the deep-gather (load-bound)
-                # phase of one group overlaps the shallow (compute-bound) phase
-                # of another.
-                gs = getattr(self, "GRP", 0)
-                self._prio = (r + v // gs) if gs else 0
-                if v in alu_set:
-                    self.s_process(v, d, last, is_leaf)
-                    continue
-                node = self.get_node(d, idx[v])
-                self.vbin("^", val[v], val[v], node)
-                self.hash_inplace(val[v])
-                if last or is_leaf:
-                    # last round: idx unused.  leaf: next round is depth 0 which
-                    # recomputes idx from scratch (ignoring the wrapped value).
-                    continue
-                # idx = 2*idx + 1 + (val & 1), all arithmetic (no flow engine).
-                bit = self.vtemp()
-                self.vbin("&", bit, val[v], one_v)
-                if d == 0:
-                    # idx starts at 0 here, so idx = 1 + bit  (no dependence on
-                    # the stale value left over from the leaf round).
-                    self.vbin("+", idx[v], bit, one_v)
-                else:
-                    inc = self.vtemp()
-                    self.vbin("+", inc, bit, one_v)
-                    self.vmadd(idx[v], idx[v], two_v, inc)
+            first_op[(r, v)] = len(self.ops)
+            if v in alu_set:
+                self.s_process(v, d, last, is_leaf, r)
+                return
+            node = self.get_node(d, idx[v], r)
+            self.vbin("^", val[v], val[v], node)
+            self.hash_inplace(val[v])
+            if last or is_leaf:
+                # last round: idx unused.  leaf: next round is depth 0 which
+                # recomputes idx from scratch.
+                return
+            # idx = 2*idx + 1 + (val & 1), all arithmetic (no flow).
+            bit = self.vtemp()
+            self.vbin("&", bit, val[v], one_v)
+            if d == 0:
+                self.vbin("+", idx[v], bit, one_v)
+            else:
+                inc = self.vtemp()
+                self.vbin("+", inc, bit, one_v)
+                self.vmadd(idx[v], idx[v], two_v, inc)
 
-        # ---- store final values ----
+        # Diagonal wavefront emission: chunk c is offset c*STAG rounds, so at a
+        # given wavefront different chunks occupy different rounds.  This keeps
+        # fine-grained interleaving (good ILP for the scheduler) while the gate
+        # dependencies below pin the stagger in place.
+        first_op = {}
+        for w in range(rounds + (NC - 1) * STAG):
+            for c in range(NC):
+                r = w - c * STAG
+                if 0 <= r < rounds:
+                    for v in chunks[c]:
+                        process(v, r)
+
+        # The deep-gather rounds are load-bound while the shallow rounds are
+        # compute-bound; in lockstep these phases can't overlap.  Inject
+        # artificial dependencies so chunk c cannot begin until chunk c-1 has
+        # reached round STAG, so chunks occupy different rounds at once and one
+        # chunk's gather loads overlap another chunk's hash compute.  The dummy
+        # scratch words carry no real data -- they only constrain the schedule.
+        for c in range(1, NC):
+            dummy = self.dummies[c - 1]
+            wop = first_op[(STAG, chunks[c - 1][0])]
+            self.ops[wop][3].append(dummy)
+            for v in chunks[c]:
+                self.ops[first_op[(0, v)]][2].append(dummy)
+
+        # ---- store final values (addresses already in init_addr) ----
         for v in range(nvec):
-            a = init_addr[v]
-            self.emit("load", ("const", a, IVP + v * VLEN), [], [a])
-            self.emit("store", ("vstore", a, val[v]), [a] + self.rng(val[v]), [])
+            self.emit("store", ("vstore", init_addr[v], val[v]),
+                      [init_addr[v]] + self.rng(val[v]), [])
 
         scheduled = self.schedule(self.ops)
         # Pauses bracket the body to match reference_kernel2's two yields; the
