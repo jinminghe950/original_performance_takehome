@@ -547,7 +547,7 @@ class KernelBuilder:
         }
 
         # dummy scratch words used only to inject pipeline-stagger dependencies
-        self.dummies = [self.alloc_scratch(None) for _ in range(max(0, getattr(self, "NC", 8) - 1))]
+        self.dummies = [self.alloc_scratch(None) for _ in range(max(0, getattr(self, "NC", 16) - 1))]
 
         self.val = val
         self.idx = idx
@@ -563,7 +563,7 @@ class KernelBuilder:
             "sh19": self.hsh[0], "sh9": self.hsh[1], "sh16": self.hsh[2],
             "f0": fnode_s[0] if 0 in need_nodes else None,
         }
-        n_stemp = (40 + 24 * n_alu) if n_alu else 0
+        n_stemp = getattr(self, "N_STEMP", (40 + 24 * n_alu) if n_alu else 0)
         self.stemps = [self.alloc_scratch(None) for _ in range(n_stemp)]
         self._si = 0
 
@@ -615,8 +615,8 @@ class KernelBuilder:
         # lanes -- otherwise the (slow, bursty) ALU work clumps into a few
         # chunks and starves the other engine there.
         alu_set = set((i * nvec) // n_alu for i in range(n_alu)) if n_alu else set()
-        NC = getattr(self, "NC", 8)
-        STAG = getattr(self, "STAG", 3)
+        NC = getattr(self, "NC", 16)
+        STAG = getattr(self, "STAG", 1)
         if NC > 1 and nvec >= NC:
             cs = nvec // NC
             chunks = [
