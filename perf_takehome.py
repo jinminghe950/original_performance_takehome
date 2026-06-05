@@ -420,6 +420,9 @@ class KernelBuilder:
                     best = cp[s]
             cp[i] = best + 1
 
+        if getattr(self, "BACKWARD", False):
+            return self._schedule_backward(ops, succs, cp)
+
         # ready-list priority: pipeline tag first (so low-index vectors race
         # ahead and stagger the deep-gather phase against the shallow compute
         # phase), then critical path.
@@ -487,6 +490,79 @@ class KernelBuilder:
                 heapq.heappush(avail, x)
             b += 1
         return bundles
+
+    def _schedule_backward(self, ops, succs, cp):
+        """Mirror-image list scheduler: schedules sinks first into decreasing
+        bundles.  Packs the tail (drain) of the schedule densely, which can beat
+        the forward pass when the head is serial (constant setup)."""
+        import heapq
+        n = len(ops)
+        preds = [[] for _ in range(n)]
+        outdeg = [0] * n
+        for i in range(n):
+            for s, dl in succs[i]:
+                preds[s].append((i, dl))
+                outdeg[i] += 1
+        prio = getattr(self, "prio", [0] * n)
+        jit = getattr(self, "JITTER", 16)
+        if jit:
+            import random as _r
+            _rng = _r.Random(jit + 777)
+            key = [(-prio[i], -cp[i], _rng.random(), i) for i in range(n)]
+        else:
+            key = [(-prio[i], -cp[i], i) for i in range(n)]
+        BIG = n + 5
+        latest = [BIG] * n
+        waiting = [(-BIG, key[i]) for i in range(n) if outdeg[i] == 0]
+        heapq.heapify(waiting)  # ordered by -latest (largest latest first)
+        avail = []
+        slots = {}
+        bmin = BIG
+        scheduled = 0
+        bundle = [0] * n
+        b = BIG
+        while scheduled < n:
+            while waiting and -waiting[0][0] >= b:
+                _, k = heapq.heappop(waiting)
+                heapq.heappush(avail, k)
+            if not avail:
+                b = -waiting[0][0]
+                continue
+            cnt = {}
+            cur = {}
+            leftover = []
+            while True:
+                progress = False
+                while avail:
+                    k = heapq.heappop(avail)
+                    i = k[-1]
+                    engine = ops[i][0]
+                    if cnt.get(engine, 0) < SLOT_LIMITS[engine]:
+                        cnt[engine] = cnt.get(engine, 0) + 1
+                        bundle[i] = b
+                        scheduled += 1
+                        progress = True
+                        cur.setdefault(engine, []).append(ops[i][1])
+                        for p, dl in preds[i]:
+                            if b - dl < latest[p]:
+                                latest[p] = b - dl
+                            outdeg[p] -= 1
+                            if outdeg[p] == 0:
+                                heapq.heappush(waiting, (-latest[p], key[p]))
+                    else:
+                        leftover.append(k)
+                while waiting and -waiting[0][0] >= b:
+                    _, k = heapq.heappop(waiting)
+                    heapq.heappush(avail, k)
+                if not avail or not progress:
+                    break
+            if cur:
+                slots[b] = cur
+                bmin = min(bmin, b)
+            for x in leftover:
+                heapq.heappush(avail, x)
+            b -= 1
+        return [slots[bb] for bb in range(bmin, BIG + 1) if bb in slots]
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
