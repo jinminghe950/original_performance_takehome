@@ -424,7 +424,17 @@ class KernelBuilder:
         # ahead and stagger the deep-gather phase against the shallow compute
         # phase), then critical path.
         prio = getattr(self, "prio", [0] * n)
-        key = [(prio[i], -cp[i], i) for i in range(n)]
+        jit = getattr(self, "JITTER", 16)
+        jr = getattr(self, "JRANGE", 0)
+        if jit:
+            import random as _r
+            _rng = _r.Random(jit)
+            if jr:
+                key = [(prio[i], -(cp[i] + _rng.randint(-jr, jr)), i) for i in range(n)]
+            else:
+                key = [(prio[i], -cp[i], _rng.random(), i) for i in range(n)]
+        else:
+            key = [(prio[i], -cp[i], i) for i in range(n)]
 
         indeg = preds
         earliest = [0] * n
@@ -451,7 +461,7 @@ class KernelBuilder:
                 progress = False
                 while avail:
                     k = heapq.heappop(avail)
-                    i = k[2]
+                    i = k[-1]
                     engine = ops[i][0]
                     if cnt.get(engine, 0) < SLOT_LIMITS[engine]:
                         cnt[engine] = cnt.get(engine, 0) + 1
