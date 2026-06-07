@@ -135,33 +135,48 @@ class KernelBuilder:
             self.rng(dest),
         )
 
-    def hash_inplace(self, a):
+    def hash_inplace(self, a, ns=None):
         """Apply the 6-stage myhash to vector `a` in place (12 valu ops).
 
         Stages 0/2/4 are of the form  a = (a+c) + (a<<s) = a*(2^s+1) + c
         which fuses into a single multiply_add.
+
+        With SHIFT_ALU set, the three shift ops (stages 1/3/5) run on the ALU
+        engine (8 scalar shifts each) instead of valu.  This is the cheapest way
+        (8:1, vs 10:1 for offloading a whole lane's hash) to move work off the
+        valu bottleneck, dropping valu hash from 12 to 9 ops/vector.
         """
         c0, c1, c2, c3, c4, c5 = self.hc
         K0, K2, K4 = self.hK
         sh19, sh9, sh16 = self.hsh
+        # SHIFT_ALU = number of the three hash shifts (stages 1,3,5) to run on
+        # the ALU.  Each offloaded shift frees a valu op but adds a valu->alu->
+        # valu round-trip, so there is a sweet spot well below 3.
+        if ns is None:
+            ns = getattr(self, "SHIFT_ALU", 3)
+        if ns is True:
+            ns = 3
+        on = [i < ns for i in range(3)]  # which shift-stages go to ALU
+        shift = lambda k, op, d, x, s: (self.aluv(op, d, x, s) if on[k]
+                                        else self.vbin(op, d, x, s))
         t = self.vtemp()
         # stage 0: + , + , <<12  ->  a*4097 + c0
         self.vmadd(a, a, K0, c0)
         # stage 1: ^ , ^ , >>19
-        self.vbin(">>", t, a, sh19)
+        shift(0, ">>", t, a, sh19)
         self.vbin("^", a, a, c1)
         self.vbin("^", a, a, t)
         # stage 2: + , + , <<5  ->  a*33 + c2
         self.vmadd(a, a, K2, c2)
         # stage 3: + , ^ , <<9
-        self.vbin("<<", t, a, sh9)
+        shift(1, "<<", t, a, sh9)
         u = self.vtemp()
         self.vbin("+", u, a, c3)
         self.vbin("^", a, t, u)
         # stage 4: + , + , <<3  ->  a*9 + c4
         self.vmadd(a, a, K4, c4)
         # stage 5: ^ , ^ , >>16
-        self.vbin(">>", t, a, sh16)
+        shift(2, ">>", t, a, sh16)
         self.vbin("^", a, a, c5)
         self.vbin("^", a, a, t)
 
@@ -195,7 +210,7 @@ class KernelBuilder:
         """Scalar arithmetic mux (no load engine) for an ALU lane at depth d."""
         sc = self.sc
         base = 2 ** d - 1
-        basev = self._bcache[base]
+        basev = self._bcache[base + 7 if getattr(self, "GADDR", False) else base]
         p = self.stemp()
         self.salu("-", p, idxw, basev)
         bits = []
@@ -224,6 +239,9 @@ class KernelBuilder:
     def s_process(self, v, d, last, is_leaf, r):
         sc = self.sc
         val_v, idx_v = self.val[v], self.idx[v]
+        gaddr = getattr(self, "GADDR", False)
+        c_d0 = sc["g_lo"] if gaddr else sc["one"]
+        c_inc = sc["g_inclo"] if gaddr else sc["one"]
         for j in range(VLEN):
             aw = val_v + j
             if d == 0:
@@ -233,6 +251,9 @@ class KernelBuilder:
                 # are gathered here (cheap, only these few lanes) to avoid the
                 # heavy scalar mux tree -- keeps the ALU engine balanced.
                 node = self.s_mux(d, idx_v + j)
+            elif gaddr:
+                node = self.stemp()
+                self.emit("load", ("load", node, idx_v + j), [idx_v + j], [node])
             else:
                 addr = self.stemp()
                 self.salu("+", addr, idx_v + j, sc["seven"])
@@ -245,12 +266,12 @@ class KernelBuilder:
             bit = self.stemp()
             self.salu("&", bit, aw, sc["one"])
             if d == 0:
-                self.salu("+", idx_v + j, bit, sc["one"])
+                self.salu("+", idx_v + j, bit, c_d0)
             else:
                 t = self.stemp()
                 self.salu("*", t, idx_v + j, sc["two"])
-                self.salu("+", t, t, sc["one"])
-                self.salu("+", idx_v + j, t, bit)
+                self.salu("+", t, t, bit)
+                self.salu("+", idx_v + j, t, c_inc)
 
     def arith_mux(self, d, idx_v):
         """Flow-free selection of forest[idx] for a depth-d block.
@@ -306,7 +327,7 @@ class KernelBuilder:
         ALU lane offload) to hide the flow engine's serial latency.
         """
         base = 2 ** d - 1
-        basev = self.bcast(base)
+        basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
         # Select bits are extracted as independent masks (p & 1, p & 2, p & 4):
         # vselect only tests for nonzero, so no shifts are needed.  This drops an
         # op and removes the serial shift chain, improving ILP.  On AUX_ALU the
@@ -358,12 +379,11 @@ class KernelBuilder:
             if getattr(self, "MUX_MODE", "flow") == "flow":
                 return self.flow_mux(d, idx_v)
             return self.arith_mux(d, idx_v)
-        # gather: addr = forest_values_p + idx, then scalar loads per lane.
-        # Address arithmetic goes on the ALU when AUX_ALU so valu stays hash-only.
-        addr = self.vtemp()
-        if getattr(self, "AUX_ALU", False):
-            self.aluv("+", addr, idx_v, self.seven_v)
+        # gather: with GADDR, idx_v already holds the address (idx + FP).
+        if getattr(self, "GADDR", False):
+            addr = idx_v
         else:
+            addr = self.vtemp()
             self.vbin("+", addr, idx_v, self.seven_v)
         node = self.vtemp()
         for j in range(VLEN):
@@ -427,7 +447,7 @@ class KernelBuilder:
         # ahead and stagger the deep-gather phase against the shallow compute
         # phase), then critical path.
         prio = getattr(self, "prio", [0] * n)
-        jit = getattr(self, "JITTER", 16)
+        jit = getattr(self, "JITTER", 6)
         jr = getattr(self, "JRANGE", 0)
         if jit:
             import random as _r
@@ -504,7 +524,7 @@ class KernelBuilder:
                 preds[s].append((i, dl))
                 outdeg[i] += 1
         prio = getattr(self, "prio", [0] * n)
-        jit = getattr(self, "JITTER", 16)
+        jit = getattr(self, "JITTER", 6)
         if jit:
             import random as _r
             _rng = _r.Random(jit + 777)
@@ -622,6 +642,19 @@ class KernelBuilder:
             for i in range(d):  # mux select-bit masks (1, 2, 4, ...)
                 self.bcast(1 << i)
 
+        # GADDR: track the gather address g = idx + FP as the loop state, so the
+        # per-round "addr = idx + FP" valu op disappears.  g = 2*g + (bit-(FP-1));
+        # depth-0 resets g = (FP+1) + bit.
+        self.GADDR = getattr(self, "GADDR", True)
+        if self.GADDR:
+            M = 2 ** 32
+            self.g_lo = self.bcast(FP + 1)
+            self.g_hi = self.bcast(FP + 2)
+            self.g_inclo = self.bcast((1 - FP) % M)
+            self.g_inchi = self.bcast((2 - FP) % M)
+            for d in self.mux_depths:
+                self.bcast(2 ** d - 1 + FP)
+
         # forest values to preload (depth-0 node + every mux-depth block)
         need_nodes = set()
         if 0 in used_depths:
@@ -650,7 +683,7 @@ class KernelBuilder:
 
         self.val = val
         self.idx = idx
-        n_alu = getattr(self, "ALU_VECS", 5)
+        n_alu = getattr(self, "ALU_VECS", 0)
 
         # scalar-engine constant sources (lane 0 of each broadcast holds the
         # scalar value) plus a scalar temp pool for the ALU lane path.
@@ -661,6 +694,8 @@ class KernelBuilder:
             "K0": self.hK[0], "K2": self.hK[1], "K4": self.hK[2],
             "sh19": self.hsh[0], "sh9": self.hsh[1], "sh16": self.hsh[2],
             "f0": fnode_s[0] if 0 in need_nodes else None,
+            "g_lo": self.g_lo if self.GADDR else None,
+            "g_inclo": self.g_inclo if self.GADDR else None,
         }
         n_stemp = getattr(self, "N_STEMP", (40 + 24 * n_alu) if n_alu else 0)
         self.stemps = [self.alloc_scratch(None) for _ in range(n_stemp)]
@@ -736,38 +771,62 @@ class KernelBuilder:
                 return
             node = self.get_node(d, idx[v], r)
             self.vbin("^", val[v], val[v], node)
-            self.hash_inplace(val[v])
+            # Round-specific shift offload: gather rounds are load-bound (valu
+            # is already waiting on the node), so the valu->alu->valu shift
+            # round-trip is hidden there; shallow/mux rounds are valu-bound and
+            # keep the shifts on valu unless SHIFT_ALL forces them everywhere.
+            gather_round = (d != 0) and not self.mux_here(r, d)
+            ns = getattr(self, "SHIFT_ALU", 3)
+            if not getattr(self, "SHIFT_ALL", True) and not gather_round:
+                ns = 0
+            self.hash_inplace(val[v], ns=ns)
             if last or is_leaf:
                 # last round: idx unused.  leaf: next round is depth 0 which
                 # recomputes idx from scratch.
                 return
-            # idx = 2*idx + 1 + (val & 1).  In AUX_ALU mode the parity bit and
-            # the (1+bit) increment are both computed on the ALU, leaving valu
-            # to pay only the doubling multiply_add -- so the whole index update
-            # costs valu a single op while flow stays free for the mux.
+            # Index/address update.  Without GADDR: idx = 2*idx + 1 + (val&1).
+            # With GADDR the state is g = idx+FP: g = 2*g + (bit-(FP-1)), depth-0
+            # reset g = (FP+1)+bit.  Either way: a 2-way (bit) select of the
+            # additive constant plus a doubling multiply_add.
+            if getattr(self, "GADDR", False):
+                c_d0, c_inc = self.g_lo, self.g_inclo
+                hi_d0, lo_d0, hi_inc, lo_inc = self.g_hi, self.g_lo, self.g_inchi, self.g_inclo
+            else:
+                c_d0 = c_inc = one_v
+                hi_d0 = hi_inc = two_v
+                lo_d0 = lo_inc = one_v
             if getattr(self, "AUX_ALU", False):
                 bit = self.vtemp()
                 self.aluv("&", bit, val[v], one_v)
                 if d == 0:
-                    self.aluv("+", idx[v], bit, one_v)       # idx = 1 + bit
+                    self.aluv("+", idx[v], bit, c_d0)
                 else:
                     inc = self.vtemp()
-                    self.aluv("+", inc, bit, one_v)
+                    self.aluv("+", inc, bit, c_inc)
                     self.vmadd(idx[v], idx[v], two_v, inc)
             else:
                 bit = self.vtemp()
                 self.vbin("&", bit, val[v], one_v)
-                if getattr(self, "IDX_INC_FLOW", True):
-                    inc = idx[v] if d == 0 else self.vtemp()
-                    self.emit("flow", ("vselect", inc, bit, two_v, one_v),
-                              self.rng(bit) + self.rng(two_v) + self.rng(one_v), self.rng(inc))
-                    if d != 0:
+                # Place the increment select on flow when this round is NOT
+                # muxing (flow is idle then); on mux rounds keep it on valu so
+                # flow is free to provide nodes.  'flow'/'valu' force one engine.
+                mode = getattr(self, "IDX_INC", "auto")
+                use_flow = mode == "flow" or (
+                    mode == "auto" and not (d != 0 and self.mux_here(r, d)))
+                if use_flow:
+                    if d == 0:
+                        self.emit("flow", ("vselect", idx[v], bit, hi_d0, lo_d0),
+                                  self.rng(bit) + self.rng(hi_d0) + self.rng(lo_d0), self.rng(idx[v]))
+                    else:
+                        inc = self.vtemp()
+                        self.emit("flow", ("vselect", inc, bit, hi_inc, lo_inc),
+                                  self.rng(bit) + self.rng(hi_inc) + self.rng(lo_inc), self.rng(inc))
                         self.vmadd(idx[v], idx[v], two_v, inc)
                 elif d == 0:
-                    self.vbin("+", idx[v], bit, one_v)
+                    self.vbin("+", idx[v], bit, c_d0)
                 else:
                     inc = self.vtemp()
-                    self.vbin("+", inc, bit, one_v)
+                    self.vbin("+", inc, bit, c_inc)
                     self.vmadd(idx[v], idx[v], two_v, inc)
 
         # Diagonal wavefront emission: chunk c is offset c*STAG rounds, so at a
