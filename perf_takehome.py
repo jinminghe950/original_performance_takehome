@@ -127,6 +127,11 @@ class KernelBuilder:
         for j in range(VLEN):
             self.emit("alu", (op, dest + j, a + j, bscalar), [a + j, bscalar], [dest + j])
 
+    def aluvv(self, op, dest, a, b):
+        """Per-lane ALU op with both operands vectors (8 scalar ops)."""
+        for j in range(VLEN):
+            self.emit("alu", (op, dest + j, a + j, b + j), [a + j, b + j], [dest + j])
+
     def vmadd(self, dest, a, b, c):
         self.emit(
             "valu",
@@ -750,6 +755,9 @@ class KernelBuilder:
         # lanes -- otherwise the (slow, bursty) ALU work clumps into a few
         # chunks and starves the other engine there.
         alu_set = set((i * nvec) // n_alu for i in range(n_alu)) if n_alu else set()
+        nxa = getattr(self, "XOR_ALU", 0)
+        free_vecs = [v for v in range(nvec) if v not in alu_set]
+        self.xor_alu_set = set(free_vecs[:: max(1, len(free_vecs) // nxa)][:nxa]) if nxa else set()
         NC = getattr(self, "NC", 16)
         STAG = getattr(self, "STAG", 1)
         if NC > 1 and nvec >= NC:
@@ -771,7 +779,13 @@ class KernelBuilder:
                 self.s_process(v, d, last, is_leaf, r)
                 return
             node = self.get_node(d, idx[v], r)
-            self.vbin("^", val[v], val[v], node)
+            # Balance valu vs alu: offload the node-xor for a subset of vectors
+            # to the ALU (which has slack below valu once the hash shifts are
+            # offloaded there).
+            if v in self.xor_alu_set:
+                self.aluvv("^", val[v], val[v], node)
+            else:
+                self.vbin("^", val[v], val[v], node)
             # Round-specific shift offload: gather rounds are load-bound (valu
             # is already waiting on the node), so the valu->alu->valu shift
             # round-trip is hidden there; shallow/mux rounds are valu-bound and
