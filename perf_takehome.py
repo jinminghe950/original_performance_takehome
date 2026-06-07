@@ -337,7 +337,7 @@ class KernelBuilder:
         # vselect only tests for nonzero, so no shifts are needed.  This drops an
         # op and removes the serial shift chain, improving ILP.  On AUX_ALU the
         # masking runs per-lane on the ALU to keep the whole mux off valu.
-        if getattr(self, "AUX_ALU", False):
+        if getattr(self, "AUX_ALU", False) or getattr(self, "MUXBITS_ALU", False):
             mask = lambda dst, a, m: self.aluv("&", dst, a, m)
             p = self.vtemp(); self.aluv("-", p, idx_v, basev)
         else:
