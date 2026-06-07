@@ -703,6 +703,7 @@ class KernelBuilder:
 
         # temp pool fills the remaining scratch
         pool = max(8, (SCRATCH_SIZE - self.scratch_ptr) // VLEN - 1)
+        pool = min(pool, getattr(self, "VTEMP_CAP", pool))
         self.vtemps = [self.alloc_scratch(None, VLEN) for _ in range(pool)]
         self._ti = 0
 
@@ -776,9 +777,13 @@ class KernelBuilder:
             # round-trip is hidden there; shallow/mux rounds are valu-bound and
             # keep the shifts on valu unless SHIFT_ALL forces them everywhere.
             gather_round = (d != 0) and not self.mux_here(r, d)
-            ns = getattr(self, "SHIFT_ALU", 3)
-            if not getattr(self, "SHIFT_ALL", True) and not gather_round:
-                ns = 0
+            # Offload more shifts in shallow (valu-bound) rounds; fewer in gather
+            # rounds, where valu already idles on the load so making it finish
+            # even sooner only deepens provision starvation.
+            if gather_round:
+                ns = getattr(self, "NS_GATHER", getattr(self, "SHIFT_ALU", 3))
+            else:
+                ns = getattr(self, "NS_SHALLOW", getattr(self, "SHIFT_ALU", 3))
             self.hash_inplace(val[v], ns=ns)
             if last or is_leaf:
                 # last round: idx unused.  leaf: next round is depth 0 which
