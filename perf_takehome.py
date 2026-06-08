@@ -719,7 +719,9 @@ class KernelBuilder:
 
         # base pointers (a single const each); addresses are derived from these
         # on the idle flow engine (add_imm) to keep const ops off the
-        # load-engine critical resource.
+        # load-engine critical resource.  (Materializing the addresses directly
+        # as load consts was measured slower: it adds load-engine contention
+        # with the initial vloads/gathers, while the flow setup ops hide cheaply.)
         ivp_base = self.alloc_scratch(None)
         fp_base = self.alloc_scratch(None)
         self.emit("load", ("const", ivp_base, IVP), [], [ivp_base])
@@ -743,8 +745,13 @@ class KernelBuilder:
 
         # ---- load initial values (addresses via flow add_imm, reused for the
         #      final stores) ----
+        # Record the address-op index per vector so the pipeline gates below can
+        # defer late chunks' init loads (otherwise all 32 high-critical-path
+        # loads rush the front and clog the 1-slot flow engine during fill).
+        init_op = {}
         for v in range(nvec):
             a = init_addr[v]
+            init_op[v] = len(self.ops)
             self.emit("flow", ("add_imm", a, ivp_base, v * VLEN), [ivp_base], [a])
             self.emit("load", ("vload", val[v], a), [a], self.rng(val[v]))
 
@@ -867,12 +874,18 @@ class KernelBuilder:
         # chunk's gather loads overlap another chunk's hash compute.  The dummy
         # scratch words carry no real data -- they only constrain the schedule.
         if not getattr(self, "NO_GATES", False):
+            defer_init = getattr(self, "DEFER_INIT", True)
             for c in range(1, NC):
                 dummy = self.dummies[c - 1]
                 wop = first_op[(STAG, chunks[c - 1][0])]
                 self.ops[wop][3].append(dummy)
                 for v in chunks[c]:
                     self.ops[first_op[(0, v)]][2].append(dummy)
+                    # Defer this chunk's initial-value load behind the same gate
+                    # so the 32 init loads spread across the pipeline rather than
+                    # all clogging the flow engine during the fill phase.
+                    if defer_init:
+                        self.ops[init_op[v]][2].append(dummy)
 
         # ---- store final values (addresses already in init_addr) ----
         for v in range(nvec):
