@@ -579,7 +579,7 @@ class KernelBuilder:
             asap[i] = a
 
         import random as _r
-        seeds = getattr(self, "DEADLINE_SEEDS", [14, 2, 11, 49, 5, 7, 1, 88])
+        seeds = getattr(self, "DEADLINE_SEEDS", [187, 14, 64, 139, 2, 11, 49, 7])
 
         def make_tie(seed):
             r = _r.Random(seed or 1)
@@ -832,7 +832,7 @@ class KernelBuilder:
         deadlines.  Multi-started over tie-break seeds; keeps the global best."""
         import random as _r
         n = len(ops)
-        seeds = getattr(self, "DEADLINE_SEEDS", [14, 2, 11, 49, 5, 7, 1, 88])
+        seeds = getattr(self, "DEADLINE_SEEDS", [187, 14, 64, 139, 2, 11, 49, 7])
         best = None
         bestlen = 1 << 30
         for seed in seeds:
