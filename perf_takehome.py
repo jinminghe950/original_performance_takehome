@@ -1507,11 +1507,20 @@ class KernelBuilder:
         # Record the address-op index per vector so the pipeline gates below can
         # defer late chunks' init loads (otherwise all 32 high-critical-path
         # loads rush the front and clog the 1-slot flow engine during fill).
+        # INIT_ADDR_LOAD: the init-load addresses are compile-time constants
+        # (IVP + v*VLEN), and during the fill ramp the flow engine is the pole
+        # (saturated by the mux trees) while the load engine has spare slots.
+        # Materializing the address as a load-engine const instead of a flow
+        # add_imm frees flow to provide mux nodes, unblocking the fill bubbles.
+        init_addr_load = getattr(self, "INIT_ADDR_LOAD", False)
         init_op = {}
         for v in range(nvec):
             a = init_addr[v]
             init_op[v] = len(self.ops)
-            self.emit("flow", ("add_imm", a, ivp_base, v * VLEN), [ivp_base], [a])
+            if init_addr_load:
+                self.emit("load", ("const", a, IVP + v * VLEN), [], [a])
+            else:
+                self.emit("flow", ("add_imm", a, ivp_base, v * VLEN), [ivp_base], [a])
             self.emit("load", ("vload", val[v], a), [a], self.rng(val[v]))
 
         # ---- main loop (chunk-major so pipeline-stagger gates precede the
@@ -1632,7 +1641,7 @@ class KernelBuilder:
                     # rebuild g = (2^(dm+1)-1)+FP + path_{dm+1} from stored bits.
                     bit = self.vtemp()
                     self.vbin("&", bit, val[v], one_v)   # b_dm (most recent)
-                    mode = getattr(self, "IDX_INC", "auto")
+                    mode = getattr(self, "IDX_INC", "valu")
                     use_flow = mode == "flow" or (
                         mode == "auto" and not (d != 0 and self.mux_here(r, d))) or (
                         getattr(self, "TRANS_FLOW", False))
@@ -1658,7 +1667,12 @@ class KernelBuilder:
                 # d > dm: pure gather phase, idx holds g; g = 2*g + (bit-(FP-1)).
                 bit = self.vtemp()
                 self.vbin("&", bit, val[v], one_v)
-                mode = getattr(self, "IDX_INC", "auto")
+                # IDX_INC default is "valu": route the increment select onto valu
+                # (a vbin +) rather than the flow vselect.  Although this raises
+                # the valu op count, the flow engine is the pole during the fill
+                # ramp (saturated by the mux trees), so taking the gather-round
+                # increments off flow there unblocks the fill (1177 -> 1173).
+                mode = getattr(self, "IDX_INC", "valu")
                 use_flow = mode == "flow" or (
                     mode == "auto" and not (d != 0 and self.mux_here(r, d)))
                 inc = self.vtemp()
@@ -1685,7 +1699,7 @@ class KernelBuilder:
                 # d == dm: path -> g (gather addr);  d > dm: g -> g
                 hi, lo = (self.trans_const_hi, self.trans_const) if d == self.dm \
                     else (self.g_inchi, self.g_inclo)
-                mode = getattr(self, "IDX_INC", "auto")
+                mode = getattr(self, "IDX_INC", "valu")
                 # The path->g transition increment normally lands on valu (it's a
                 # mux round), but flow has plenty of global slack -- route it there
                 # to shave the valu pole.
@@ -1722,7 +1736,7 @@ class KernelBuilder:
                 # Place the increment select on flow when this round is NOT
                 # muxing (flow is idle then); on mux rounds keep it on valu so
                 # flow is free to provide nodes.  'flow'/'valu' force one engine.
-                mode = getattr(self, "IDX_INC", "auto")
+                mode = getattr(self, "IDX_INC", "valu")
                 use_flow = mode == "flow" or (
                     mode == "auto" and not (d != 0 and self.mux_here(r, d)))
                 if use_flow:
@@ -1766,7 +1780,12 @@ class KernelBuilder:
         # chunk's gather loads overlap another chunk's hash compute.  The dummy
         # scratch words carry no real data -- they only constrain the schedule.
         if not getattr(self, "NO_GATES", False):
-            defer_init = getattr(self, "DEFER_INIT", True)
+            # DEFER_INIT used to gate each chunk's initial vload behind its
+            # pipeline-stagger dummy (to spread the 32 init loads).  Measured a
+            # touch faster to let all init loads issue eagerly: the load engine
+            # absorbs them during the fill ramp and the gather pipeline starts
+            # sooner (1178 -> 1177).
+            defer_init = getattr(self, "DEFER_INIT", False)
             for c in range(1, NC):
                 stag_c = offsets[c] - offsets[c - 1]
                 if stag_c <= 0:
