@@ -448,12 +448,14 @@ class KernelBuilder:
         if getattr(self, "BACKWARD", False):
             return self._schedule_backward(ops, succs, cp)
 
-        # ready-list priority: pipeline tag first (so low-index vectors race
-        # ahead and stagger the deep-gather phase against the shallow compute
-        # phase), then critical path.
         prio = getattr(self, "prio", [0] * n)
-        jit = getattr(self, "JITTER", 6)
+        jit = getattr(self, "JITTER", 14)
         jr = getattr(self, "JRANGE", 0)
+
+        sched_mode = getattr(self, "SCHED", "deadline")
+        if sched_mode == "deadline":
+            return self._schedule_deadline(ops, succs, preds, cp, prio)
+
         if jit:
             import random as _r
             _rng = _r.Random(jit)
@@ -464,13 +466,22 @@ class KernelBuilder:
         else:
             key = [(prio[i], -cp[i], i) for i in range(n)]
 
-        indeg = preds
+        return self._list_sched(ops, succs, preds, key)
+
+    def _list_sched(self, ops, succs, preds, key):
+        """Forward greedy list scheduler with the given ready-list priority key.
+
+        `preds` is the per-op predecessor *count*; `succs[i]` is a list of
+        (successor, delay) pairs.  Returns a list of VLIW bundles.
+        """
+        import heapq
+        n = len(ops)
+        indeg = list(preds)
         earliest = [0] * n
         waiting = [(0, key[i]) for i in range(n) if indeg[i] == 0]
         heapq.heapify(waiting)
         avail = []
         bundles = []
-        bundle = [-1] * n
         b = 0
         scheduled = 0
         while scheduled < n:
@@ -493,7 +504,6 @@ class KernelBuilder:
                     engine = ops[i][0]
                     if cnt.get(engine, 0) < SLOT_LIMITS[engine]:
                         cnt[engine] = cnt.get(engine, 0) + 1
-                        bundle[i] = b
                         scheduled += 1
                         progress = True
                         cur.setdefault(engine, []).append(ops[i][1])
@@ -515,6 +525,65 @@ class KernelBuilder:
                 heapq.heappush(avail, x)
             b += 1
         return bundles
+
+    def _schedule_deadline(self, ops, succs, preds, cp, prio):
+        """Minimum-slack (ALAP-deadline) list scheduling with iterative makespan
+        tightening.
+
+        The op list is already topologically ordered (dependencies only point
+        backward), so ASAP/ALAP are exact single-pass relaxations.  We schedule
+        the most urgent (earliest-deadline) ready op first; a tighter target
+        makespan M produces tighter deadlines and tends to pack the bottleneck
+        engine harder.  We sweep M downward from the cp-greedy result and keep
+        the shortest valid schedule.
+        """
+        n = len(ops)
+        # explicit predecessors with delay for ALAP
+        rpred = [[] for _ in range(n)]
+        for i in range(n):
+            for s, dl in succs[i]:
+                rpred[s].append((i, dl))
+        # ASAP (exact, forward over topo order)
+        asap = [0] * n
+        for i in range(n):
+            a = 0
+            for p, dl in rpred[i]:
+                if asap[p] + dl > a:
+                    a = asap[p] + dl
+            asap[i] = a
+
+        jit = getattr(self, "JITTER", 14)
+        import random as _r
+        _rng = _r.Random(jit or 1)
+        tie = [_rng.random() for _ in range(n)]
+
+        def alap_key(M):
+            alap = [M] * n
+            for i in range(n - 1, -1, -1):
+                v = M
+                for s, dl in succs[i]:
+                    if alap[s] - dl < v:
+                        v = alap[s] - dl
+                alap[i] = v
+            return [(prio[i], alap[i], -cp[i], tie[i], i) for i in range(n)]
+
+        # baseline cp-greedy makespan as the starting target
+        cpkey = [(prio[i], -cp[i], tie[i], i) for i in range(n)]
+        best = self._list_sched(ops, succs, preds, cpkey)
+        bestlen = len(best)
+        # iterative tightening
+        step = getattr(self, "DEADLINE_STEP", 2)
+        tries = getattr(self, "DEADLINE_TRIES", 12)
+        M = bestlen
+        for _ in range(tries):
+            M = M - step
+            if M < max(cp):
+                break
+            cand = self._list_sched(ops, succs, preds, alap_key(M))
+            if len(cand) < bestlen:
+                best, bestlen = cand, len(cand)
+                M = bestlen  # re-anchor to the new (shorter) makespan
+        return best
 
     def _schedule_backward(self, ops, succs, cp):
         """Mirror-image list scheduler: schedules sinks first into decreasing
@@ -855,14 +924,20 @@ class KernelBuilder:
                     self.vbin("+", inc, bit, c_inc)
                     self.vmadd(idx[v], idx[v], two_v, inc)
 
-        # Diagonal wavefront emission: chunk c is offset c*STAG rounds, so at a
-        # given wavefront different chunks occupy different rounds.  This keeps
-        # fine-grained interleaving (good ILP for the scheduler) while the gate
-        # dependencies below pin the stagger in place.
+        # Diagonal wavefront emission: chunk c trails chunk 0 by offset[c]
+        # rounds, so at a given wavefront different chunks occupy different rounds
+        # (fine-grained interleaving = good ILP).  offset is cumulative; the
+        # default is uniform (offset[c] = c*STAG) but a compressing tail (smaller
+        # late increments) bunches the trailing chunks so the drain has more
+        # parallel tail work.
+        offsets = getattr(self, "OFFSETS", None)
+        if offsets is None:
+            offsets = [c * STAG for c in range(NC)]
+        self._offsets = offsets
         first_op = {}
-        for w in range(rounds + (NC - 1) * STAG):
+        for w in range(rounds + (offsets[-1] if offsets else 0)):
             for c in range(NC):
-                r = w - c * STAG
+                r = w - offsets[c]
                 if 0 <= r < rounds:
                     for v in chunks[c]:
                         process(v, r)
@@ -876,8 +951,11 @@ class KernelBuilder:
         if not getattr(self, "NO_GATES", False):
             defer_init = getattr(self, "DEFER_INIT", True)
             for c in range(1, NC):
+                stag_c = offsets[c] - offsets[c - 1]
+                if stag_c <= 0:
+                    continue
                 dummy = self.dummies[c - 1]
-                wop = first_op[(STAG, chunks[c - 1][0])]
+                wop = first_op[(stag_c, chunks[c - 1][0])]
                 self.ops[wop][3].append(dummy)
                 for v in chunks[c]:
                     self.ops[first_op[(0, v)]][2].append(dummy)
