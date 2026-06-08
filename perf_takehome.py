@@ -355,6 +355,10 @@ class KernelBuilder:
                 self.aluv("-", p, idx_v, basev)
             else:
                 self.vbin("-", p, idx_v, basev)
+        # The top mask bit feeds the last (least latency-critical) mux level and
+        # is off the valu hash chain, so for selected depths we extract it on the
+        # ALU -- shaving the valu pole with negligible coupling.
+        top_alu = d in getattr(self, "MASK_ALU_DEPTHS", set())
         bits = []
         for i in range(d):
             # For d==1, p is already in {0,1} (= b0), so the &1 mask is a no-op;
@@ -363,7 +367,10 @@ class KernelBuilder:
                 bits.append(p)
                 break
             bt = self.vtemp()
-            mask(bt, p, self.bcast(1 << i))
+            if top_alu and i == d - 1:
+                self.aluv("&", bt, p, self.bcast(1 << i))
+            else:
+                mask(bt, p, self.bcast(1 << i))
             bits.append(bt)
         level = [self.fbcast[base + k] for k in range(2 ** d)]
         for i in range(d):
@@ -1131,8 +1138,12 @@ class KernelBuilder:
                 hi, lo = (self.trans_const_hi, self.trans_const) if d == self.dm \
                     else (self.g_inchi, self.g_inclo)
                 mode = getattr(self, "IDX_INC", "auto")
+                # The path->g transition increment normally lands on valu (it's a
+                # mux round), but flow has plenty of global slack -- route it there
+                # to shave the valu pole.
                 use_flow = mode == "flow" or (
-                    mode == "auto" and not (d != 0 and self.mux_here(r, d)))
+                    mode == "auto" and not (d != 0 and self.mux_here(r, d))) or (
+                    d == self.dm and getattr(self, "TRANS_FLOW", False))
                 inc = self.vtemp()
                 if use_flow:
                     self.emit("flow", ("vselect", inc, bit, hi, lo),
