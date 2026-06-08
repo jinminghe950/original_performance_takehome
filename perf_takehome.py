@@ -880,7 +880,14 @@ class KernelBuilder:
         # Route the leading chunks' first-pass mux (which lands in that fill
         # window) through the arithmetic (valu) mux instead, soaking up the idle
         # valu and freeing the flow engine so the pipeline ramps faster.
-        fill_arith = getattr(self, "FILL_ARITH", 2)
+        fill_arith = getattr(self, "FILL_ARITH", 3)
+        # Drain optimization: the trailing chunks finish their last rounds with
+        # little parallelism left, so they are bound by the hash critical path
+        # rather than valu throughput.  Keeping their shifts on valu (ns=0)
+        # removes the valu->alu->valu round-trip latency; the extra valu ops are
+        # free because valu is idle in the drain anyway.
+        drain_chunks = getattr(self, "DRAIN_CHUNKS", 1)
+        drain_from = getattr(self, "DRAIN_FROM", 12)
 
         def process(v, r):
             d = depth_of(r)
@@ -890,7 +897,11 @@ class KernelBuilder:
             if v in alu_set:
                 self.s_process(v, d, last, is_leaf, r)
                 return
-            fa = fill_arith and vec2chunk.get(v, 99) < fill_arith and r <= self.H
+            ci = vec2chunk.get(v, 99)
+            in_drain = drain_chunks and ci >= NC - drain_chunks and r >= drain_from
+            # arith (valu) mux has lower latency than the serial flow tree, which
+            # helps both the fill window (idle valu) and the latency-bound drain.
+            fa = (fill_arith and ci < fill_arith and r <= self.H) or in_drain
             node = self.get_node(d, idx[v], r, force_arith=fa)
             # Balance valu vs alu: offload the node-xor for a subset of vectors
             # to the ALU (which has slack below valu once the hash shifts are
@@ -911,6 +922,8 @@ class KernelBuilder:
                 ns = getattr(self, "NS_GATHER", getattr(self, "SHIFT_ALU", 3))
             else:
                 ns = getattr(self, "NS_SHALLOW", getattr(self, "SHIFT_ALU", 3))
+            if in_drain:
+                ns = 0  # latency-bound drain: keep shifts on valu
             self.hash_inplace(val[v], ns=ns)
             if last or is_leaf:
                 # last round: idx unused.  leaf: next round is depth 0 which
