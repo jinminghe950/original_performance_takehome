@@ -572,6 +572,13 @@ class KernelBuilder:
         jr = getattr(self, "JRANGE", 0)
 
         sched_mode = getattr(self, "SCHED", "deadline")
+        # Beam search keeps several *partial* schedules alive and prunes by a
+        # resource lower bound, so it can reach non-greedy schedules the list
+        # scheduler (and the priority-only SA) cannot.  Default off (slow build).
+        if getattr(self, "BEAM", False):
+            res = self._schedule_beam(ops, succs, preds, cp, prio)
+            if res is not None:
+                return res
         # Iterated-local-search ("simulated annealing") refinement.  The greedy
         # list scheduler plateaus because its ready-list tie-breaking is fixed;
         # ILS perturbs a small random subset of per-op priority weights, re-runs
@@ -600,6 +607,145 @@ class KernelBuilder:
             key = [(prio[i], -cp[i], i) for i in range(n)]
 
         return self._list_sched(ops, succs, preds, key)
+
+    def _schedule_beam(self, ops, succs, preds, cp, prio):
+        """Beam-search list scheduler.
+
+        Keeps W partial schedules alive.  Each round advances every kept state by
+        one VLIW bundle, generating C candidate bundle-fillings per state (via C
+        priority orderings of the ready set), then prunes the W*C successors to
+        the W with the smallest lower-bound on final makespan.  Because pruning
+        is by a global lower bound rather than a fixed greedy rule, it can keep a
+        locally-suboptimal bundle that leads to a globally-shorter schedule -- the
+        thing the greedy list scheduler and the priority-only SA cannot do.
+        """
+        import random, time
+        from collections import Counter
+        n = len(ops)
+        W = getattr(self, "BEAM_W", 4)
+        C = getattr(self, "BEAM_C", 5)
+        tlimit = getattr(self, "BEAM_TIME", 600)
+        eng = [ops[i][0] for i in range(n)]
+        slots = SLOT_LIMITS
+        eng_total = Counter(eng)
+        engset = list(eng_total)
+
+        # ALAP deadlines (for a tight target makespan M) -- this is what makes the
+        # deadline list scheduler strong, so the beam uses it as its base ordering
+        # and explores around it.
+        M = getattr(self, "BEAM_M", 1180)
+        alap = [M - 1] * n
+        for i in range(n - 1, -1, -1):
+            for s, dl in succs[i]:
+                if alap[s] - dl < alap[i]:
+                    alap[i] = alap[s] - dl
+        # C candidate priority orderings: ALAP base + perturbations.
+        keys = [[(prio[i], alap[i], -cp[i], 0.0, i) for i in range(n)]]
+        for s in range(1, C):
+            rng = random.Random(9001 + s)
+            keys.append([(prio[i], alap[i], -cp[i], rng.random(), i) for i in range(n)])
+
+        def lower_bound(b, done):
+            # projected makespan: current cycle + remaining work / slot rate on
+            # the busiest engine (resource bound -- exact for the load-bound graph)
+            lb = b
+            for e in engset:
+                rem = eng_total[e] - done[e]
+                if rem:
+                    need = b + (rem + slots[e] - 1) // slots[e]
+                    if need > lb:
+                        lb = need
+            return lb
+
+        def advance(st, key):
+            """Build one bundle from state st using priority `key`; return the
+            successor state dict (fresh copies of mutable structures)."""
+            indeg = st["indeg"][:]
+            earliest = st["earliest"][:]
+            ready = set(st["ready"])
+            done = Counter(st["done"])
+            b = st["b"]
+            # if nothing is schedulable this cycle, jump to the next release time
+            if not any(earliest[i] <= b for i in ready):
+                b = min(earliest[i] for i in ready)
+            cnt = {}
+            cur = {}
+            placed = 0
+            # greedily fill the bundle, re-scanning so WAR-relaxed (delay-0)
+            # successors freed within this bundle can also join it
+            while True:
+                cand = [i for i in ready
+                        if earliest[i] <= b and cnt.get(eng[i], 0) < slots[eng[i]]]
+                if not cand:
+                    break
+                cand.sort(key=key.__getitem__)
+                progressed = False
+                for i in cand:
+                    e = eng[i]
+                    if cnt.get(e, 0) < slots[e]:
+                        cnt[e] = cnt.get(e, 0) + 1
+                        cur.setdefault(e, []).append(ops[i][1])
+                        done[e] += 1
+                        placed += 1
+                        ready.discard(i)
+                        progressed = True
+                        for sc, dl in succs[i]:
+                            indeg[sc] -= 1
+                            t = b + dl
+                            if t > earliest[sc]:
+                                earliest[sc] = t
+                            if indeg[sc] == 0:
+                                ready.add(sc)
+                if not progressed:
+                    break
+            return {
+                "indeg": indeg, "earliest": earliest, "ready": ready,
+                "done": done, "b": b + 1, "sched": st["sched"] + placed,
+                "bundles": st["bundles"] + [cur],
+            }
+
+        start = {
+            "indeg": list(preds), "earliest": [0] * n,
+            "ready": {i for i in range(n) if preds[i] == 0},
+            "done": Counter(), "b": 0, "sched": 0, "bundles": [],
+        }
+        beam = [start]
+        t0 = time.time()
+        best = None
+        while beam:
+            succ = []
+            for st in beam:
+                if st["sched"] == n:
+                    if best is None or len(st["bundles"]) < len(best):
+                        best = st["bundles"]
+                    continue
+                seen = set()
+                for key in keys:
+                    ns = advance(st, key)
+                    # dedup near-identical successors (same progress signature)
+                    sig = (ns["b"], ns["sched"])
+                    if sig in seen and len(succ) > W:
+                        continue
+                    seen.add(sig)
+                    succ.append((lower_bound(ns["b"], ns["done"]), -ns["sched"], ns))
+            if not succ:
+                break
+            succ.sort(key=lambda x: (x[0], x[1]))
+            beam = [s[2] for s in succ[:W]]
+            # prune states already provably worse than a complete schedule
+            if best is not None:
+                bl = len(best)
+                beam = [s for s in beam if lower_bound(s["b"], s["done"]) < bl] or beam[:1]
+            if time.time() - t0 > tlimit:
+                # finish the most promising state greedily and return the best
+                beam.sort(key=lambda s: lower_bound(s["b"], s["done"]))
+                st = beam[0]
+                while st["sched"] < n:
+                    st = advance(st, keys[0])
+                if best is None or len(st["bundles"]) < len(best):
+                    best = st["bundles"]
+                break
+        return best
 
     def _list_sched(self, ops, succs, preds, key):
         """Forward greedy list scheduler with the given ready-list priority key.
