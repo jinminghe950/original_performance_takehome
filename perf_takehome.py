@@ -1075,7 +1075,7 @@ class KernelBuilder:
         # rather than valu throughput.  Keeping their shifts on valu (ns=0)
         # removes the valu->alu->valu round-trip latency; the extra valu ops are
         # free because valu is idle in the drain anyway.
-        drain_chunks = getattr(self, "DRAIN_CHUNKS", 2)
+        drain_chunks = getattr(self, "DRAIN_CHUNKS", 1)
         drain_from = getattr(self, "DRAIN_FROM", 13)
 
         def process(v, r):
