@@ -479,6 +479,16 @@ class KernelBuilder:
         jr = getattr(self, "JRANGE", 0)
 
         sched_mode = getattr(self, "SCHED", "deadline")
+        # Iterated-local-search ("simulated annealing") refinement.  The greedy
+        # list scheduler plateaus because its ready-list tie-breaking is fixed;
+        # ILS perturbs a small random subset of per-op priority weights, re-runs
+        # the (cheap) list scheduler, and keeps improvements (with rare uphill
+        # moves to escape plateaus).  This explores schedules the deterministic
+        # multi-seed deadline scheduler cannot reach, breaking the plateau.
+        if getattr(self, "SA_SCHED", True) and sched_mode != "list":
+            res = self._schedule_sa(ops, succs, preds, cp, prio)
+            if res is not None:
+                return res
         if sched_mode == "deadline":
             return self._schedule_deadline(ops, succs, preds, cp, prio)
 
@@ -551,6 +561,177 @@ class KernelBuilder:
                 heapq.heappush(avail, x)
             b += 1
         return bundles
+
+    def _list_sched_assign(self, ops, succs, preds, key):
+        """Forward greedy list scheduler returning a per-op bundle index.
+
+        Same packing rule as _list_sched (re-scan within a bundle so WAR-relaxed
+        delay-0 successors can join the same bundle), but records op -> bundle so
+        the SA refiner can compute the makespan and reconstruct slot lists.
+        """
+        import heapq
+        n = len(ops)
+        indeg = list(preds)
+        earliest = [0] * n
+        bundle = [-1] * n
+        waiting = [(0, key[i]) for i in range(n) if indeg[i] == 0]
+        heapq.heapify(waiting)
+        avail = []
+        b = 0
+        scheduled = 0
+        while scheduled < n:
+            while waiting and waiting[0][0] <= b:
+                _, k = heapq.heappop(waiting)
+                heapq.heappush(avail, k)
+            if not avail:
+                b = waiting[0][0]
+                continue
+            cnt = {}
+            leftover = []
+            while True:
+                progress = False
+                while avail:
+                    k = heapq.heappop(avail)
+                    i = k[-1]
+                    engine = ops[i][0]
+                    if cnt.get(engine, 0) < SLOT_LIMITS[engine]:
+                        cnt[engine] = cnt.get(engine, 0) + 1
+                        bundle[i] = b
+                        scheduled += 1
+                        progress = True
+                        for s, dl in succs[i]:
+                            indeg[s] -= 1
+                            if b + dl > earliest[s]:
+                                earliest[s] = b + dl
+                            if indeg[s] == 0:
+                                heapq.heappush(waiting, (earliest[s], key[s]))
+                    else:
+                        leftover.append(k)
+                while waiting and waiting[0][0] <= b:
+                    _, k = heapq.heappop(waiting)
+                    heapq.heappush(avail, k)
+                if not avail or not progress:
+                    break
+            for x in leftover:
+                heapq.heappush(avail, x)
+            b += 1
+        return bundle, b
+
+    def _schedule_sa(self, ops, succs, preds, cp, prio):
+        """Iterated local search ("simulated annealing") over per-op priority
+        weights.
+
+        The list scheduler is a deterministic function of the ready-list ordering
+        key.  We fix the macro priority (prio, ALAP deadline, critical path) and
+        let a per-op random weight w[i] break ties.  Each step perturbs a small
+        random subset of weights, reschedules with the cheap list scheduler, and
+        keeps the result if it doesn't lengthen the makespan (with a small uphill
+        acceptance probability + restart-from-best to escape plateaus).
+
+        This reaches schedules below the multi-seed greedy plateau because the
+        plateau is an artifact of *fixed* tie-breaking, not a true lower bound;
+        the engine-throughput / dependency lower bound is well below it.
+
+        Returns a list of VLIW bundles, or None to fall back to the deadline
+        scheduler (so correctness never depends on the search succeeding).
+        """
+        import random as _r
+        import time as _time
+
+        n = len(ops)
+        if n == 0:
+            return None
+
+        # ALAP deadlines for a fixed target makespan -- pulls bottleneck-engine
+        # work earlier and matches the deadline scheduler's macro ordering.
+        M = getattr(self, "SA_ALAP_M", 1200)
+        alap = [M] * n
+        for i in range(n - 1, -1, -1):
+            v = M
+            for s, dl in succs[i]:
+                if alap[s] - dl < v:
+                    v = alap[s] - dl
+            alap[i] = v
+
+        def run(w):
+            key = [(prio[i], alap[i], -cp[i], w[i], i) for i in range(n)]
+            return self._list_sched_assign(ops, succs, preds, key)
+
+        # Search is controlled by a deterministic iteration budget (so the result
+        # is reproducible across hardware) plus a wall-clock guard (so a slow or
+        # heavily-loaded machine can't hang -- it just keeps the best-so-far).
+        max_iters = getattr(self, "SA_ITERS", 1700)
+        time_budget = getattr(self, "SA_TIME", 600.0)
+        seed = getattr(self, "SA_SEED", 99)
+        perturb_lo = getattr(self, "SA_PLO", 5)
+        perturb_hi = getattr(self, "SA_PHI", 40)
+        uphill = getattr(self, "SA_UPHILL", 0.02)
+        plateau_limit = getattr(self, "SA_PLATEAU", 500)
+
+        # Baseline assignment from a deterministic tie-break (gives a valid start
+        # and the value to beat); the SA only ever returns something no worse.
+        base_w = [0.0] * n
+        best_assign, best_mk = run(base_w)
+        best_w = list(base_w)
+        # Floor from the production deadline scheduler so the SA never regresses
+        # below the known-good schedule on any hardware: if the search does not
+        # improve (e.g. a slow machine gives few iterations) we return the
+        # deadline schedule, which is deterministic and always <= the greedy.
+        self._sa_floor_bundles = None
+        if getattr(self, "SA_USE_FLOOR", True):
+            fb = self._schedule_deadline(ops, succs, preds, cp, prio)
+            if fb is not None:
+                self._sa_floor_bundles = fb
+                self._sa_floor_len = len(fb)
+                if self._sa_floor_len < best_mk:
+                    best_mk = self._sa_floor_len
+
+        t0 = _time.time()
+        rng = _r.Random(seed)
+        w = [rng.random() for _ in range(n)]
+        assign, cur = run(w)
+        if cur < best_mk:
+            best_mk, best_assign, best_w = cur, assign, list(w)
+        plateau = 0
+        for _it in range(max_iters):
+            if _time.time() - t0 >= time_budget:
+                break
+            old = []
+            for _ in range(rng.randint(perturb_lo, perturb_hi)):
+                j = rng.randrange(n)
+                old.append((j, w[j]))
+                w[j] = rng.random()
+            assign, mk = run(w)
+            if mk <= cur or rng.random() < uphill:
+                plateau = 0 if mk < cur else plateau + 1
+                cur = mk
+                if mk < best_mk:
+                    best_mk, best_assign, best_w = mk, assign, list(w)
+            else:
+                plateau += 1
+                for j, ov in old:
+                    w[j] = ov
+            if plateau > plateau_limit:
+                # restart from the global best to intensify around it
+                w = list(best_w)
+                cur = best_mk
+                plateau = 0
+
+        # If the deadline floor is shorter than anything SA found, use it.
+        if self._sa_floor_bundles is not None and self._sa_floor_len <= best_mk:
+            return self._sa_floor_bundles
+
+        # Reconstruct VLIW bundles from the best op -> bundle assignment.
+        # Drop any empty bundle indices (the list scheduler can leave gaps when
+        # it fast-forwards past a stall): an empty {} instruction would be a
+        # silent no-op that the simulator does not count as a cycle, so emitting
+        # only the non-empty bundles (in order) keeps len(instrs) == cycle count.
+        slots = [dict() for _ in range(best_mk)]
+        for i in range(n):
+            b = best_assign[i]
+            engine = ops[i][0]
+            slots[b].setdefault(engine, []).append(ops[i][1])
+        return [bd for bd in slots if bd]
 
     def _schedule_deadline(self, ops, succs, preds, cp, prio):
         """Minimum-slack (ALAP-deadline) list scheduling with iterative makespan
