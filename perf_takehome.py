@@ -278,25 +278,16 @@ class KernelBuilder:
                 self.salu("+", t, t, bit)
                 self.salu("+", idx_v + j, t, c_inc)
 
-    def arith_mux(self, d, idx_v):
-        """Flow-free selection of forest[idx] for a depth-d block.
+    def _cp_bit(self, j, v):
+        """Carried-parity storage slot for descent bit b_j of walker-vector v.
 
-        Builds a mux tree using arithmetic selects (select(c,a,b)=b+c*(a-b),
-        a single multiply_add when c is a 0/1 bit) over the preloaded block
-        broadcasts.  First-level differences are precomputed once at setup.
-        Avoids the flow engine entirely (the flow engine is 1 slot/cycle and
-        serializes the critical path badly for mux trees).
-        """
-        base = 2 ** d - 1
-        one_v = self.bcast(1)
-        if getattr(self, "path_track", False):
-            p = idx_v  # idx_v already holds the path offset
-        else:
-            p = self.vtemp()
-            # Under GADDR the index state is g = idx + FP, so subtract base + FP.
-            basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
-            self.vbin("-", p, idx_v, basev)
-        # extract bits b0 (LSB) .. b_{d-1}
+        Bits b_0..b_{dm-2} live in a rented pool slot bp[j][cur_bp[v]]; the
+        most-recent bit b_{dm-1} reuses idx[v] (idle during the mux phase,
+        overwritten with the gather address at the depth-dm transition)."""
+        return self.bp[j][self.cur_bp[v]] if j < self.dm - 1 else self.idx[v]
+
+    def _extract_bits(self, d, p, one_v):
+        """Extract bits b0 (LSB) .. b_{d-1} from packed path p (valu &/>> ops)."""
         bits = []
         pp = p
         for i in range(d):
@@ -309,6 +300,31 @@ class KernelBuilder:
                 np = self.vtemp()
                 self.vbin(">>", np, pp, one_v)
                 pp = np
+        return bits
+
+    def arith_mux(self, d, idx_v, cp_bits=None):
+        """Flow-free selection of forest[idx] for a depth-d block.
+
+        Builds a mux tree using arithmetic selects (select(c,a,b)=b+c*(a-b),
+        a single multiply_add when c is a 0/1 bit) over the preloaded block
+        broadcasts.  First-level differences are precomputed once at setup.
+        Avoids the flow engine entirely (the flow engine is 1 slot/cycle and
+        serializes the critical path badly for mux trees).
+        """
+        base = 2 ** d - 1
+        one_v = self.bcast(1)
+        if cp_bits is not None:
+            # Carried-parity: the descent bits are already stored unpacked.
+            bits = cp_bits
+        elif getattr(self, "path_track", False):
+            p = idx_v  # idx_v already holds the path offset
+            bits = self._extract_bits(d, p, one_v)
+        else:
+            p = self.vtemp()
+            # Under GADDR the index state is g = idx + FP, so subtract base + FP.
+            basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
+            self.vbin("-", p, idx_v, basev)
+            bits = self._extract_bits(d, p, one_v)
         # level 0: constant broadcasts combined with precomputed diffs
         diffs = self.muxdiff[d]
         level = []
@@ -328,7 +344,7 @@ class KernelBuilder:
             level = nxt
         return level[0]
 
-    def flow_mux(self, d, idx_v):
+    def flow_mux(self, d, idx_v, cp_bits=None):
         """Select forest[idx] using a vselect mux tree on the flow engine.
 
         Only the (cheap) bit extraction costs valu; the selects themselves run
@@ -337,6 +353,25 @@ class KernelBuilder:
         ALU lane offload) to hide the flow engine's serial latency.
         """
         base = 2 ** d - 1
+        # Carried-parity: the descent bits are already stored unpacked, so we
+        # skip mask extraction entirely and drive the vselect tree directly.
+        # cp_bits[i] is the bit feeding mux level i (LSB-first, matching the
+        # path&(1<<i) order the masked path would have produced).
+        if cp_bits is not None:
+            level = [self.fbcast[base + k] for k in range(2 ** d)]
+            for i in range(d):
+                nxt = []
+                for k in range(0, len(level), 2):
+                    out = self.vtemp()
+                    self.emit(
+                        "flow",
+                        ("vselect", out, cp_bits[i], level[k + 1], level[k]),
+                        self.rng(cp_bits[i]) + self.rng(level[k + 1]) + self.rng(level[k]),
+                        self.rng(out),
+                    )
+                    nxt.append(out)
+                level = nxt
+            return level[0]
         # Select bits are extracted as independent masks (p & 1, p & 2, p & 4):
         # vselect only tests for nonzero, so no shifts are needed.  This drops an
         # op and removes the serial shift chain, improving ILP.  On AUX_ALU the
@@ -400,16 +435,16 @@ class KernelBuilder:
             return True
         return False
 
-    def get_node(self, d, idx_v, r, force_arith=False):
+    def get_node(self, d, idx_v, r, force_arith=False, cp_bits=None):
         """Vector of node values forest[idx] for this round's depth d."""
         if d == 0:
             return self.fbcast[0]
         if self.mux_here(r, d):
             if force_arith:
-                return self.arith_mux(d, idx_v)
+                return self.arith_mux(d, idx_v, cp_bits=cp_bits)
             if getattr(self, "MUX_MODE", "flow") == "flow":
-                return self.flow_mux(d, idx_v)
-            return self.arith_mux(d, idx_v)
+                return self.flow_mux(d, idx_v, cp_bits=cp_bits)
+            return self.arith_mux(d, idx_v, cp_bits=cp_bits)
         # gather: with GADDR, idx_v already holds the address (idx + FP).
         if getattr(self, "GADDR", False):
             addr = idx_v
@@ -420,6 +455,64 @@ class KernelBuilder:
         for j in range(VLEN):
             self.emit("load", ("load", node + j, addr + j), [addr + j], [node + j])
         return node
+
+    def _pipeline_layout(self, nvec):
+        """Deterministic (NC, chunks, offsets) for the diagonal wavefront.
+
+        Factored out so the carried-parity bit-slot pool can be sized from the
+        exact emission order before any ops (and the pool) are allocated."""
+        NC = getattr(self, "NC", 16)
+        STAG = getattr(self, "STAG", 1)
+        sizes = getattr(self, "CHUNK_SIZES", None)
+        if sizes is not None and sum(sizes) == nvec:
+            chunks = []
+            p = 0
+            for s in sizes:
+                chunks.append(list(range(p, p + s)))
+                p += s
+            NC = len(chunks)
+        elif NC > 1 and nvec >= NC:
+            cs = nvec // NC
+            chunks = [
+                list(range(c * cs, nvec if c == NC - 1 else (c + 1) * cs))
+                for c in range(NC)
+            ]
+        else:
+            NC = 1
+            chunks = [list(range(nvec))]
+        offsets = getattr(self, "OFFSETS", None)
+        if offsets is None:
+            offsets = [c * STAG for c in range(NC)]
+        return NC, chunks, offsets
+
+    def _cp_peak_slots(self, nvec, rounds, H, dm):
+        """Replay the wavefront emission order and return the peak number of
+        simultaneously-live carried-parity descents (= bit-slot pool size needed
+        for correct, schedule-independent slot reuse)."""
+        NC, chunks, offsets = self._pipeline_layout(nvec)
+        alu_set = set()  # cp lanes are never on the ALU path
+        live = 0
+        peak = 0
+        depth_of = lambda r: r % (H + 1)
+        for w in range(rounds + (offsets[-1] if offsets else 0)):
+            for c in range(NC):
+                r = w - offsets[c]
+                if not (0 <= r < rounds):
+                    continue
+                d = depth_of(r)
+                last = r == rounds - 1
+                is_leaf = (d == H) and not last
+                for v in chunks[c]:
+                    if v in alu_set:
+                        continue
+                    if last or is_leaf:
+                        continue
+                    if d == 0:
+                        live += 1            # descent starts
+                        peak = max(peak, live)
+                    elif d == dm:
+                        live -= 1            # descent ends
+        return peak
 
     def schedule(self, ops):
         """Readiness-based list scheduler -> list of VLIW bundles.
@@ -760,7 +853,9 @@ class KernelBuilder:
             asap[i] = a
 
         import random as _r
-        seeds = getattr(self, "DEADLINE_SEEDS", [187, 14, 64, 139, 2, 11, 49, 7])
+        # Seed 473 yields the tightest tie-break for the carried-parity op graph
+        # (1181 -> 1180); the rest are the previously-tuned multi-start set.
+        seeds = getattr(self, "DEADLINE_SEEDS", [473, 187, 14, 64, 139, 2, 11, 49])
 
         def make_tie(seed):
             r = _r.Random(seed or 1)
@@ -1117,6 +1212,41 @@ class KernelBuilder:
             self.trans_const = self.bcast((2 ** (dm + 1) - 1) + FP)       # bit=0
             self.trans_const_hi = self.bcast((2 ** (dm + 1) - 1) + FP + 1)  # bit=1
 
+        # CARRIED-PARITY (cp_track): instead of packing the descent bits into a
+        # path offset each mux round (path = 2*path + bit) and then re-extracting
+        # those bits with &-masks for the mux selector, store the branch bits
+        # *unpacked* in their own slots.  The bit (val & 1) is already computed
+        # every round for the index update, so storing it costs nothing extra;
+        # the mux then consumes the stored bits directly, eliminating the ~5 valu
+        # &-masks per descent pass (both the mux masks AND the intermediate
+        # packing madds), paying back only the few madds that rebuild the packed
+        # gather address once at the deepest mux depth.  Net: valu floor ~1083 ->
+        # ~1030.  Storage: only dm-1 extra bit-vectors/walker beyond idx -- the
+        # final (most-recent) bit lives in the otherwise-idle idx slot during the
+        # mux phase, and idx is rewritten to the gather address at the transition.
+        self.cp_track = getattr(self, "CP_TRACK", True) and self.path_track and dm >= 2
+        # Transient bit storage: the unpacked bits b_0..b_{dm-2} for a walker are
+        # live only during that walker's short descent (d=0 -> d=dm).  In the
+        # pipelined wavefront only a bounded number of descents overlap at once,
+        # so we rent the (dm-1)-vector bit slot from a small shared pool sized to
+        # that exact peak -- about half the storage a per-walker scheme needs,
+        # which is what lets carried-parity fit alongside the scheduler's vtemp
+        # pool.  A slot is returned only after its renter's last read (the d=dm
+        # round) has been *emitted*, so in program order no two live descents ever
+        # alias -- the hazard tracker always attributes each bit's last-writer
+        # correctly (correct by construction, schedule- and data-independent).
+        if self.cp_track:
+            peak = self._cp_peak_slots(nvec, rounds, H, dm)
+            self.cp_bp_slots = getattr(self, "CP_BP_SLOTS", peak)
+            assert self.cp_bp_slots >= peak, "CP_BP_SLOTS below required peak"
+            self.bp = [
+                [self.alloc_scratch(None, VLEN) for _ in range(self.cp_bp_slots)]
+                for _ in range(dm - 1)
+            ]
+            self.cur_bp = [0] * nvec
+            self._bp_free = list(range(self.cp_bp_slots))
+            self._bp_peak = 0
+
         # forest values to preload (depth-0 node + every mux-depth block)
         need_nodes = set()
         if 0 in used_depths:
@@ -1125,13 +1255,34 @@ class KernelBuilder:
             for k in range(2 ** d):
                 need_nodes.add((2 ** d - 1) + k)
 
-        # scalar addr regs reused for initial vloads / final vstores
-        init_addr = [self.alloc_scratch(None) for _ in range(nvec)]
+        # scalar addr regs for initial vloads / final vstores.  Under carried-
+        # parity the bit-slot pool is scratch-hungry, so instead of dedicating 32
+        # persistent address regs we recompute each address from ivp_base on the
+        # idle flow engine at both the init load and the final store (CP_RECLAIM).
+        cp_reclaim = self.cp_track and getattr(self, "CP_RECLAIM", True)
+        if cp_reclaim:
+            # small rotating pool of scalar address regs (init loads early, final
+            # stores late -- they never overlap, so a handful suffice).
+            n_ia = getattr(self, "N_INIT_ADDR", 6)
+            init_addr_pool = [self.alloc_scratch(None) for _ in range(n_ia)]
+            init_addr = [init_addr_pool[v % n_ia] for v in range(nvec)]
+        else:
+            init_addr = [self.alloc_scratch(None) for _ in range(nvec)]
 
-        # preallocate broadcast scalars/vectors and forest-preload storage
-        fnode_s = {n: self.alloc_scratch(None) for n in need_nodes}
+        # preallocate broadcast scalars/vectors and forest-preload storage.
+        # fnode_s/fnode_a are setup-only (load node -> vbroadcast); under cp we
+        # rent them from small rotating pools to reclaim scratch for vtemps.
+        nn = sorted(need_nodes)
+        if cp_reclaim:
+            n_fn = getattr(self, "N_FNODE", 6)
+            fs_pool = [self.alloc_scratch(None) for _ in range(n_fn)]
+            fa_pool = [self.alloc_scratch(None) for _ in range(n_fn)]
+            fnode_s = {n: fs_pool[i % n_fn] for i, n in enumerate(nn)}
+            fnode_a = {n: fa_pool[i % n_fn] for i, n in enumerate(nn)}
+        else:
+            fnode_s = {n: self.alloc_scratch(None) for n in need_nodes}
+            fnode_a = {n: self.alloc_scratch(None) for n in need_nodes}
         self.fnode_s = fnode_s
-        fnode_a = {n: self.alloc_scratch(None) for n in need_nodes}
         self.fbcast = {n: self.alloc_scratch(None, VLEN) for n in need_nodes}
 
         # precomputed first-level mux differences (constant per pair)
@@ -1163,8 +1314,9 @@ class KernelBuilder:
         self.stemps = [self.alloc_scratch(None) for _ in range(n_stemp)]
         self._si = 0
 
-        # temp pool fills the remaining scratch
-        pool = max(8, (SCRATCH_SIZE - self.scratch_ptr) // VLEN - 1)
+        # temp pool fills the remaining scratch (leaving room for the 2 base
+        # pointers allocated after the pool: ivp_base, fp_base).
+        pool = max(1, (SCRATCH_SIZE - self.scratch_ptr - 2) // VLEN)
         pool = min(pool, getattr(self, "VTEMP_CAP", pool))
         self.vtemps = [self.alloc_scratch(None, VLEN) for _ in range(pool)]
         self._ti = 0
@@ -1256,7 +1408,9 @@ class KernelBuilder:
         # rather than valu throughput.  Keeping their shifts on valu (ns=0)
         # removes the valu->alu->valu round-trip latency; the extra valu ops are
         # free because valu is idle in the drain anyway.
-        drain_chunks = getattr(self, "DRAIN_CHUNKS", 1)
+        # Carried-parity shifts the engine balance (valu is no longer the pole),
+        # so its latency-bound drain wants two trailing chunks held on valu.
+        drain_chunks = getattr(self, "DRAIN_CHUNKS", 2 if self.cp_track else 1)
         drain_from = getattr(self, "DRAIN_FROM", 13)
 
         def process(v, r):
@@ -1272,7 +1426,12 @@ class KernelBuilder:
             # arith (valu) mux has lower latency than the serial flow tree, which
             # helps both the fill window (idle valu) and the latency-bound drain.
             fa = (fill_arith and ci < fill_arith and r <= self.H) or in_drain
-            node = self.get_node(d, idx[v], r, force_arith=fa)
+            # Carried-parity: the descent bits for this depth's mux are stored
+            # unpacked, so hand them to the mux directly (no &-mask extraction).
+            cp_bits = None
+            if getattr(self, "cp_track", False) and self.mux_here(r, d) and d >= 1:
+                cp_bits = [self._cp_bit(d - 1 - i, v) for i in range(d)]
+            node = self.get_node(d, idx[v], r, force_arith=fa, cp_bits=cp_bits)
             # Balance valu vs alu: offload the node-xor for a subset of vectors
             # to the ALU (which has slack below valu once the hash shifts are
             # offloaded there).
@@ -1303,6 +1462,64 @@ class KernelBuilder:
             # With GADDR the state is g = idx+FP: g = 2*g + (bit-(FP-1)), depth-0
             # reset g = (FP+1)+bit.  Either way: a 2-way (bit) select of the
             # additive constant plus a doubling multiply_add.
+            if getattr(self, "cp_track", False):
+                # Carried-parity: store the branch bit unpacked; the mux consumes
+                # the stored bits directly so no &-mask extraction is needed, and
+                # there is no intermediate path-packing madd until the deepest
+                # mux depth (dm), where we rebuild the packed gather address.
+                one_v = self._bcache[1]; two_v = self._bcache[2]
+                if d == 0:
+                    # rent a fresh bit-slot from the free-list for this descent.
+                    assert self._bp_free, "cp bit-slot pool exhausted"
+                    self.cur_bp[v] = self._bp_free.pop()
+                    self._bp_peak = max(self._bp_peak,
+                                        self.cp_bp_slots - len(self._bp_free))
+                if d < self.dm:
+                    # store b_d into its slot (bp[d][cur_bp[v]], or idx when d==dm-1)
+                    self.vbin("&", self._cp_bit(d, v), val[v], one_v)
+                    return
+                if d == self.dm:
+                    # rebuild g = (2^(dm+1)-1)+FP + path_{dm+1} from stored bits.
+                    bit = self.vtemp()
+                    self.vbin("&", bit, val[v], one_v)   # b_dm (most recent)
+                    mode = getattr(self, "IDX_INC", "auto")
+                    use_flow = mode == "flow" or (
+                        mode == "auto" and not (d != 0 and self.mux_here(r, d))) or (
+                        getattr(self, "TRANS_FLOW", False))
+                    inc = self.vtemp()
+                    if use_flow:
+                        self.emit("flow", ("vselect", inc, bit,
+                                  self.trans_const_hi, self.trans_const),
+                                  self.rng(bit) + self.rng(self.trans_const_hi)
+                                  + self.rng(self.trans_const), self.rng(inc))
+                    else:
+                        self.vbin("+", inc, bit, self.trans_const)
+                    # Horner fold of b0..b_{dm-1} (MSB-first), then *2 + inc -> g.
+                    acc = self._cp_bit(0, v)  # b0 (MSB)
+                    for j in range(1, self.dm):
+                        nxt = self.vtemp()
+                        bj = self._cp_bit(j, v)
+                        self.vmadd(nxt, acc, two_v, bj)  # acc = 2*acc + b_j
+                        acc = nxt
+                    self.vmadd(idx[v], acc, two_v, inc)  # g = 2*acc + (b_dm+base)
+                    # descent done: all bits consumed, return the slot to the pool.
+                    self._bp_free.append(self.cur_bp[v])
+                    return
+                # d > dm: pure gather phase, idx holds g; g = 2*g + (bit-(FP-1)).
+                bit = self.vtemp()
+                self.vbin("&", bit, val[v], one_v)
+                mode = getattr(self, "IDX_INC", "auto")
+                use_flow = mode == "flow" or (
+                    mode == "auto" and not (d != 0 and self.mux_here(r, d)))
+                inc = self.vtemp()
+                if use_flow:
+                    self.emit("flow", ("vselect", inc, bit, self.g_inchi, self.g_inclo),
+                              self.rng(bit) + self.rng(self.g_inchi) + self.rng(self.g_inclo),
+                              self.rng(inc))
+                else:
+                    self.vbin("+", inc, bit, self.g_inclo)
+                self.vmadd(idx[v], idx[v], two_v, inc)
+                return
             if getattr(self, "path_track", False):
                 # Carry the path offset through the mux phase (no const add, no
                 # mux subtract), convert path -> g at the deepest mux depth dm.
@@ -1415,10 +1632,18 @@ class KernelBuilder:
                     if defer_init:
                         self.ops[init_op[v]][2].append(dummy)
 
-        # ---- store final values (addresses already in init_addr) ----
-        for v in range(nvec):
-            self.emit("store", ("vstore", init_addr[v], val[v]),
-                      [init_addr[v]] + self.rng(val[v]), [])
+        # ---- store final values ----
+        if cp_reclaim:
+            # recompute the store addresses (init_addr regs were rotated/reused).
+            for v in range(nvec):
+                a = init_addr[v]
+                self.emit("flow", ("add_imm", a, ivp_base, v * VLEN), [ivp_base], [a])
+                self.emit("store", ("vstore", a, val[v]), [a] + self.rng(val[v]), [])
+        else:
+            # addresses already persisted in init_addr from the initial loads.
+            for v in range(nvec):
+                self.emit("store", ("vstore", init_addr[v], val[v]),
+                          [init_addr[v]] + self.rng(val[v]), [])
 
         scheduled = self.schedule(self.ops)
         # The submission harness (tests/submission_tests.py) runs once with
