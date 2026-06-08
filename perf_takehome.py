@@ -1062,14 +1062,14 @@ class KernelBuilder:
         # Route the leading chunks' first-pass mux (which lands in that fill
         # window) through the arithmetic (valu) mux instead, soaking up the idle
         # valu and freeing the flow engine so the pipeline ramps faster.
-        fill_arith = getattr(self, "FILL_ARITH", 3)
+        fill_arith = getattr(self, "FILL_ARITH", 2)
         # Drain optimization: the trailing chunks finish their last rounds with
         # little parallelism left, so they are bound by the hash critical path
         # rather than valu throughput.  Keeping their shifts on valu (ns=0)
         # removes the valu->alu->valu round-trip latency; the extra valu ops are
         # free because valu is idle in the drain anyway.
-        drain_chunks = getattr(self, "DRAIN_CHUNKS", 1)
-        drain_from = getattr(self, "DRAIN_FROM", 12)
+        drain_chunks = getattr(self, "DRAIN_CHUNKS", 2)
+        drain_from = getattr(self, "DRAIN_FROM", 13)
 
         def process(v, r):
             d = depth_of(r)
