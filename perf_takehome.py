@@ -290,7 +290,9 @@ class KernelBuilder:
         base = 2 ** d - 1
         one_v = self.bcast(1)
         p = self.vtemp()
-        self.vbin("-", p, idx_v, self.bcast(base))
+        # Under GADDR the index state is g = idx + FP, so subtract base + FP.
+        basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
+        self.vbin("-", p, idx_v, basev)
         # extract bits b0 (LSB) .. b_{d-1}
         bits = []
         pp = p
@@ -345,6 +347,11 @@ class KernelBuilder:
             p = self.vtemp(); self.vbin("-", p, idx_v, basev)
         bits = []
         for i in range(d):
+            # For d==1, p is already in {0,1} (= b0), so the &1 mask is a no-op;
+            # vselect tests nonzero, so we can feed p directly and save the op.
+            if d == 1:
+                bits.append(p)
+                break
             bt = self.vtemp()
             mask(bt, p, self.bcast(1 << i))
             bits.append(bt)
@@ -376,11 +383,13 @@ class KernelBuilder:
             return True
         return False
 
-    def get_node(self, d, idx_v, r):
+    def get_node(self, d, idx_v, r, force_arith=False):
         """Vector of node values forest[idx] for this round's depth d."""
         if d == 0:
             return self.fbcast[0]
         if self.mux_here(r, d):
+            if force_arith:
+                return self.arith_mux(d, idx_v)
             if getattr(self, "MUX_MODE", "flow") == "flow":
                 return self.flow_mux(d, idx_v)
             return self.arith_mux(d, idx_v)
@@ -552,12 +561,14 @@ class KernelBuilder:
                     a = asap[p] + dl
             asap[i] = a
 
-        jit = getattr(self, "JITTER", 14)
         import random as _r
-        _rng = _r.Random(jit or 1)
-        tie = [_rng.random() for _ in range(n)]
+        seeds = getattr(self, "DEADLINE_SEEDS", [14, 2, 11, 49, 5, 7, 1, 88])
 
-        def alap_key(M):
+        def make_tie(seed):
+            r = _r.Random(seed or 1)
+            return [r.random() for _ in range(n)]
+
+        def alap_key(M, tie):
             alap = [M] * n
             for i in range(n - 1, -1, -1):
                 v = M
@@ -567,22 +578,29 @@ class KernelBuilder:
                 alap[i] = v
             return [(prio[i], alap[i], -cp[i], tie[i], i) for i in range(n)]
 
-        # baseline cp-greedy makespan as the starting target
-        cpkey = [(prio[i], -cp[i], tie[i], i) for i in range(n)]
-        best = self._list_sched(ops, succs, preds, cpkey)
-        bestlen = len(best)
-        # iterative tightening
-        step = getattr(self, "DEADLINE_STEP", 2)
-        tries = getattr(self, "DEADLINE_TRIES", 12)
-        M = bestlen
-        for _ in range(tries):
-            M = M - step
-            if M < max(cp):
-                break
-            cand = self._list_sched(ops, succs, preds, alap_key(M))
+        step = getattr(self, "DEADLINE_STEP", 1)
+        tries = getattr(self, "DEADLINE_TRIES", 16)
+        best = None
+        bestlen = 1 << 30
+        # Multi-start: each seed perturbs only the tie-break, exploring a
+        # different valid schedule; we keep the global shortest.  Within a seed
+        # we sweep the target makespan M downward (tighter deadlines pack the
+        # bottleneck harder), re-anchoring whenever we find a shorter schedule.
+        for si, seed in enumerate(seeds):
+            tie = make_tie(seed)
+            cpkey = [(prio[i], -cp[i], tie[i], i) for i in range(n)]
+            cand = self._list_sched(ops, succs, preds, cpkey)
             if len(cand) < bestlen:
                 best, bestlen = cand, len(cand)
-                M = bestlen  # re-anchor to the new (shorter) makespan
+            M = bestlen
+            for _ in range(tries):
+                M = M - step
+                if M < max(cp):
+                    break
+                cand = self._list_sched(ops, succs, preds, alap_key(M, tie))
+                if len(cand) < bestlen:
+                    best, bestlen = cand, len(cand)
+                    M = bestlen
         return best
 
     def _schedule_backward(self, ops, succs, cp):
@@ -836,7 +854,15 @@ class KernelBuilder:
         self.xor_alu_set = set(free_vecs[:: max(1, len(free_vecs) // nxa)][:nxa]) if nxa else set()
         NC = getattr(self, "NC", 16)
         STAG = getattr(self, "STAG", 1)
-        if NC > 1 and nvec >= NC:
+        sizes = getattr(self, "CHUNK_SIZES", None)
+        if sizes is not None and sum(sizes) == nvec:
+            chunks = []
+            p = 0
+            for s in sizes:
+                chunks.append(list(range(p, p + s)))
+                p += s
+            NC = len(chunks)
+        elif NC > 1 and nvec >= NC:
             cs = nvec // NC
             chunks = [
                 list(range(c * cs, nvec if c == NC - 1 else (c + 1) * cs))
@@ -846,6 +872,16 @@ class KernelBuilder:
             NC = 1
             chunks = [list(range(nvec))]
 
+        vec2chunk = {}
+        for ci, ch in enumerate(chunks):
+            for v in ch:
+                vec2chunk[v] = ci
+        # During the fill phase valu idles while flow saturates on the mux trees.
+        # Route the leading chunks' first-pass mux (which lands in that fill
+        # window) through the arithmetic (valu) mux instead, soaking up the idle
+        # valu and freeing the flow engine so the pipeline ramps faster.
+        fill_arith = getattr(self, "FILL_ARITH", 2)
+
         def process(v, r):
             d = depth_of(r)
             last = r == rounds - 1
@@ -854,7 +890,8 @@ class KernelBuilder:
             if v in alu_set:
                 self.s_process(v, d, last, is_leaf, r)
                 return
-            node = self.get_node(d, idx[v], r)
+            fa = fill_arith and vec2chunk.get(v, 99) < fill_arith and r <= self.H
+            node = self.get_node(d, idx[v], r, force_arith=fa)
             # Balance valu vs alu: offload the node-xor for a subset of vectors
             # to the ALU (which has slack below valu once the hash shifts are
             # offloaded there).
