@@ -289,10 +289,13 @@ class KernelBuilder:
         """
         base = 2 ** d - 1
         one_v = self.bcast(1)
-        p = self.vtemp()
-        # Under GADDR the index state is g = idx + FP, so subtract base + FP.
-        basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
-        self.vbin("-", p, idx_v, basev)
+        if getattr(self, "path_track", False):
+            p = idx_v  # idx_v already holds the path offset
+        else:
+            p = self.vtemp()
+            # Under GADDR the index state is g = idx + FP, so subtract base + FP.
+            basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
+            self.vbin("-", p, idx_v, basev)
         # extract bits b0 (LSB) .. b_{d-1}
         bits = []
         pp = p
@@ -334,17 +337,24 @@ class KernelBuilder:
         ALU lane offload) to hide the flow engine's serial latency.
         """
         base = 2 ** d - 1
-        basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
         # Select bits are extracted as independent masks (p & 1, p & 2, p & 4):
         # vselect only tests for nonzero, so no shifts are needed.  This drops an
         # op and removes the serial shift chain, improving ILP.  On AUX_ALU the
         # masking runs per-lane on the ALU to keep the whole mux off valu.
         if getattr(self, "AUX_ALU", False) or getattr(self, "MUXBITS_ALU", False):
             mask = lambda dst, a, m: self.aluv("&", dst, a, m)
-            p = self.vtemp(); self.aluv("-", p, idx_v, basev)
         else:
             mask = lambda dst, a, m: self.vbin("&", dst, a, m)
-            p = self.vtemp(); self.vbin("-", p, idx_v, basev)
+        if getattr(self, "path_track", False):
+            # idx_v already holds the path offset (idx - base) -- no subtract.
+            p = idx_v
+        else:
+            basev = self.bcast(base + 7 if getattr(self, "GADDR", False) else base)
+            p = self.vtemp()
+            if getattr(self, "AUX_ALU", False) or getattr(self, "MUXBITS_ALU", False):
+                self.aluv("-", p, idx_v, basev)
+            else:
+                self.vbin("-", p, idx_v, basev)
         bits = []
         for i in range(d):
             # For d==1, p is already in {0,1} (= b0), so the &1 mask is a no-op;
@@ -900,6 +910,25 @@ class KernelBuilder:
             for d in self.mux_depths:
                 self.bcast(2 ** d - 1 + FP)
 
+        # PATH_TRACK: during the shallow mux phase, carry the *path* offset
+        # (path = idx - (2^d - 1)) instead of the gather address g = idx + FP.
+        # Then the mux selector is the path itself -- no "p = g - base" subtract
+        # -- and the path recurrence is path = 2*path + bit (no additive const),
+        # so each mux round drops ~2 valu ops.  At the deepest mux depth dm we
+        # convert path -> g for the gather phase in the same madd we already do.
+        # Only valid when the mux depths are exactly {1..dm}, no mux_late, and
+        # there are deeper gather rounds (dm < H); otherwise fall back to GADDR.
+        dm = max(self.mux_always) if self.mux_always else 0
+        self.path_track = (
+            getattr(self, "PATH_TRACK", True) and self.GADDR
+            and not self.mux_late and dm >= 1 and dm < H
+            and self.mux_always == set(range(1, dm + 1))
+        )
+        self.dm = dm
+        if self.path_track:
+            self.trans_const = self.bcast((2 ** (dm + 1) - 1) + FP)       # bit=0
+            self.trans_const_hi = self.bcast((2 ** (dm + 1) - 1) + FP + 1)  # bit=1
+
         # forest values to preload (depth-0 node + every mux-depth block)
         need_nodes = set()
         if 0 in used_depths:
@@ -1086,6 +1115,32 @@ class KernelBuilder:
             # With GADDR the state is g = idx+FP: g = 2*g + (bit-(FP-1)), depth-0
             # reset g = (FP+1)+bit.  Either way: a 2-way (bit) select of the
             # additive constant plus a doubling multiply_add.
+            if getattr(self, "path_track", False):
+                # Carry the path offset through the mux phase (no const add, no
+                # mux subtract), convert path -> g at the deepest mux depth dm.
+                one_v = self._bcache[1]; two_v = self._bcache[2]
+                if d == 0:
+                    self.vbin("&", idx[v], val[v], one_v)   # path_1 = val & 1
+                    return
+                bit = self.vtemp()
+                self.vbin("&", bit, val[v], one_v)
+                if d < self.dm:
+                    self.vmadd(idx[v], idx[v], two_v, bit)  # path = 2*path + bit
+                    return
+                # d == dm: path -> g (gather addr);  d > dm: g -> g
+                hi, lo = (self.trans_const_hi, self.trans_const) if d == self.dm \
+                    else (self.g_inchi, self.g_inclo)
+                mode = getattr(self, "IDX_INC", "auto")
+                use_flow = mode == "flow" or (
+                    mode == "auto" and not (d != 0 and self.mux_here(r, d)))
+                inc = self.vtemp()
+                if use_flow:
+                    self.emit("flow", ("vselect", inc, bit, hi, lo),
+                              self.rng(bit) + self.rng(hi) + self.rng(lo), self.rng(inc))
+                else:
+                    self.vbin("+", inc, bit, lo)
+                self.vmadd(idx[v], idx[v], two_v, inc)
+                return
             if getattr(self, "GADDR", False):
                 c_d0, c_inc = self.g_lo, self.g_inclo
                 hi_d0, lo_d0, hi_inc, lo_inc = self.g_hi, self.g_lo, self.g_inchi, self.g_inclo
