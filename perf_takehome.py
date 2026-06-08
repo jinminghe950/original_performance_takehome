@@ -578,7 +578,11 @@ class KernelBuilder:
         # the (cheap) list scheduler, and keeps improvements (with rare uphill
         # moves to escape plateaus).  This explores schedules the deterministic
         # multi-seed deadline scheduler cannot reach, breaking the plateau.
-        if getattr(self, "SA_SCHED", True) and sched_mode != "list":
+        # NOTE: on the carried-parity (load-bound) op graph the SA finds no
+        # improvement over the deadline schedule (already at the scheduling
+        # floor), so it is off by default to keep the build fast; it still helps
+        # the path-tracking graph, so it remains available via SA_SCHED=True.
+        if getattr(self, "SA_SCHED", False) and sched_mode != "list":
             res = self._schedule_sa(ops, succs, preds, cp, prio)
             if res is not None:
                 return res
