@@ -1279,6 +1279,23 @@ class KernelBuilder:
         assert batch_size % VLEN == 0, "batch size must be a multiple of VLEN"
         nvec = batch_size // VLEN
 
+        # Pipeline geometry tuned for the (H=10, rounds=16, batch=256 -> nvec=32)
+        # submission case by an offline correctness-gated search over chunk
+        # sizes / wavefront offsets / fill-drain balance.  Size-1 trailing chunks
+        # let the (low-parallelism) drain finish faster, and starting the first
+        # two chunks together (offset 0,0) tightens the fill ramp: 1173 -> 1167.
+        # Guarded to nvec==32 so other shapes keep the generic NC-based layout.
+        if nvec == 32 and rounds == 16 and H == 10:
+            if not hasattr(self, "CHUNK_SIZES"):
+                self.CHUNK_SIZES = [2] * 14 + [1] * 4
+                self.NC = 18  # match the chunk count so dummies[] is sized right
+            if not hasattr(self, "OFFSETS"):
+                self.OFFSETS = [0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            if not hasattr(self, "FILL_ARITH"):
+                self.FILL_ARITH = 1
+            if not hasattr(self, "DRAIN_FROM"):
+                self.DRAIN_FROM = 9
+
         # Memory layout is deterministic from the shapes (see build_mem_image):
         FP = 7  # forest_values_p (header == 7)
         IVP = 7 + n_nodes + batch_size  # inp_values_p
@@ -1673,7 +1690,12 @@ class KernelBuilder:
                 # ramp (saturated by the mux trees), so taking the gather-round
                 # increments off flow there unblocks the fill (1177 -> 1173).
                 mode = getattr(self, "IDX_INC", "valu")
-                use_flow = mode == "flow" or (
+                # GATHER_IDX_FLOW: in pure gather rounds the flow engine is idle
+                # (the mux trees only run at the shallow mux depths), so routing
+                # just these increment-selects onto flow drops them off the valu
+                # pole without the fill-phase flow contention that a global
+                # IDX_INC='flow' suffers.
+                use_flow = getattr(self, "GATHER_IDX_FLOW", False) or mode == "flow" or (
                     mode == "auto" and not (d != 0 and self.mux_here(r, d)))
                 inc = self.vtemp()
                 if use_flow:
