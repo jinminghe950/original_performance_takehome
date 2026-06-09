@@ -1290,11 +1290,15 @@ class KernelBuilder:
                 self.CHUNK_SIZES = [2] * 14 + [1] * 4
                 self.NC = 18  # match the chunk count so dummies[] is sized right
             if not hasattr(self, "OFFSETS"):
-                self.OFFSETS = [0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+                self.OFFSETS = [0, 0, 2, 3, 4, 5, 7, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
             if not hasattr(self, "FILL_ARITH"):
                 self.FILL_ARITH = 1
             if not hasattr(self, "DRAIN_FROM"):
-                self.DRAIN_FROM = 9
+                self.DRAIN_FROM = 12
+            if not hasattr(self, "XOR_ALU"):
+                self.XOR_ALU = 4  # offload 4 lanes' node-xor onto the spare ALU
+            if not hasattr(self, "NS_GATHER"):
+                self.NS_GATHER = 2  # gather rounds: keep one hash shift on valu
 
         # Memory layout is deterministic from the shapes (see build_mem_image):
         FP = 7  # forest_values_p (header == 7)
