@@ -435,10 +435,33 @@ class KernelBuilder:
             return True
         return False
 
-    def get_node(self, d, idx_v, r, force_arith=False, cp_bits=None):
+    def get_node(self, d, idx_v, r, force_arith=False, cp_bits=None,
+                 force_gather=False):
         """Vector of node values forest[idx] for this round's depth d."""
         if d == 0:
             return self.fbcast[0]
+        if force_gather:
+            # Fill-gather: the load engine is idle during the fill ramp while the
+            # mux trees bottleneck the flow engine, so the leading chunks read
+            # their shallow-depth nodes from memory instead.  We need the gather
+            # address = path + (2^d-1+FP).  Under path_track idx_v already holds
+            # the path; under cp_track the descent bits are stored unpacked, so
+            # rebuild the path with a Horner fold (cheap valu, free in the fill
+            # window).  cp_bits[0]=b_{d-1} (most recent) .. cp_bits[d-1]=b_0.
+            if cp_bits is not None:
+                path = cp_bits[d - 1]  # b_0 (MSB)
+                for j in range(1, d):
+                    nxt = self.vtemp()
+                    self.vmadd(nxt, path, self._bcache[2], cp_bits[d - 1 - j])
+                    path = nxt
+            else:
+                path = idx_v
+            addr = self.vtemp()
+            self.vbin("+", addr, path, self._bcache[2 ** d - 1 + 7])
+            node = self.vtemp()
+            for j in range(VLEN):
+                self.emit("load", ("load", node + j, addr + j), [addr + j], [node + j])
+            return node
         if self.mux_here(r, d):
             if force_arith:
                 return self.arith_mux(d, idx_v, cp_bits=cp_bits)
@@ -1299,6 +1322,11 @@ class KernelBuilder:
                 self.XOR_ALU = 4  # offload 4 lanes' node-xor onto the spare ALU
             if not hasattr(self, "NS_GATHER"):
                 self.NS_GATHER = 2  # gather rounds: keep one hash shift on valu
+            if not hasattr(self, "FILL_GATHER"):
+                # The first chunk reads its depth-1 node from memory (idle load
+                # engine) instead of a flow mux tree, easing the fill ramp.
+                self.FILL_GATHER = 1
+                self.FG_MAXD = 2
 
         # Memory layout is deterministic from the shapes (see build_mem_image):
         FP = 7  # forest_values_p (header == 7)
@@ -1592,6 +1620,12 @@ class KernelBuilder:
         # so its latency-bound drain wants two trailing chunks held on valu.
         drain_chunks = getattr(self, "DRAIN_CHUNKS", 2 if self.cp_track else 1)
         drain_from = getattr(self, "DRAIN_FROM", 13)
+        # Fill-gather: the leading FILL_GATHER chunks read their shallow-depth
+        # nodes from memory (idle load engine) instead of building mux trees on
+        # the (fill-bottleneck) flow/valu engines.  Requires path_track, where
+        # idx[v] holds the path offset so a gather address is one add away.
+        fill_gather = getattr(self, "FILL_GATHER", 0) if self.path_track else 0
+        fg_chunks = set(range(fill_gather))
 
         def process(v, r):
             d = depth_of(r)
@@ -1611,7 +1645,10 @@ class KernelBuilder:
             cp_bits = None
             if getattr(self, "cp_track", False) and self.mux_here(r, d) and d >= 1:
                 cp_bits = [self._cp_bit(d - 1 - i, v) for i in range(d)]
-            node = self.get_node(d, idx[v], r, force_arith=fa, cp_bits=cp_bits)
+            fg = (ci in fg_chunks and self.mux_here(r, d) and d >= 1 and r <= self.H
+                  and d < getattr(self, "FG_MAXD", self.dm + 1))
+            node = self.get_node(d, idx[v], r, force_arith=fa, cp_bits=cp_bits,
+                                 force_gather=fg)
             # Balance valu vs alu: offload the node-xor for a subset of vectors
             # to the ALU (which has slack below valu once the hash shifts are
             # offloaded there).
